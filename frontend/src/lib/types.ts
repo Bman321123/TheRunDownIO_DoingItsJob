@@ -96,8 +96,15 @@ export type ScanNowResponse = {
   arbs?: Arb[];
   lines?: RawLine[];
   bestLines?: BestLine[];
-  matchedGames?: MatchedGame[];
+  matchedGames?: number;
+  sourceCounts?: {
+    therundown: number;
+    bovada: number;
+    kalshi: number;
+    polymarket: number;
+  };
   bovadaError?: string | null;
+  pmError?: string | null;
   error?: string;
   dataAge?: number;
   dpRemaining?: string;

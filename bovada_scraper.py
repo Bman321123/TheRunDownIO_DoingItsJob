@@ -60,6 +60,19 @@ _BOVADA_MARKET_MAP: dict[str, str] = {
     "total": "total",
     "total runs": "total",
     "total goals": "total",
+    "total goals o/u": "total",   # Bovada full-game O/U label (explicit match)
+    "total points o/u": "total",  # same pattern for basketball/football
+}
+
+# Substrings that, if found in a market description, disqualify it from being
+# treated as a game-level total.  Checked BEFORE the positive-match loop so
+# team/player-specific markets are never mis-classified.
+_BOVADA_MARKET_EXCLUDE: set[str] = {
+    "team total",      # "Team Total Goals" or "Team Total"
+    "player total",    # player prop totals
+    "total goals o/u -",  # "Total Goals O/U - <Team Name>" (Bovada per-team format)
+    "total points o/u -", # same pattern for basketball/football
+    "total runs o/u -",   # same pattern for baseball
 }
 
 _DEFAULT_SPORT_PATHS: dict[str, str] = {
@@ -216,6 +229,10 @@ def _extract_teams(raw_event: dict[str, Any]) -> tuple[str, str]:
 
 def _resolve_market_type(description: str) -> Optional[str]:
     desc_lower = description.lower().strip()
+    # Reject team-specific / player-specific totals before any positive match.
+    for excl in _BOVADA_MARKET_EXCLUDE:
+        if excl in desc_lower:
+            return None
     direct = _BOVADA_MARKET_MAP.get(desc_lower)
     if direct:
         return direct

@@ -1,4 +1,5 @@
 import asyncio
+import concurrent.futures
 import json
 import time
 import threading
@@ -6,12 +7,16 @@ import logging
 import re
 from typing import Any
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 from aiohttp import web
 from rapidfuzz import fuzz
 
 import bovada_scraper
 import therundown
+import prediction_markets
+from kalshi_scraper import fetch_kalshi_markets
+from polymarket_scraper import fetch_polymarket_markets
 
 # ──────────────────────────────────────────────
 # CONFIG
@@ -29,6 +34,19 @@ _RUNDOWN_TO_BOVADA_SPORT = {
     "NCAAB": "ncaab",
     "MLB": "mlb",
     "NHL": "nhl",
+    "MMA": "mma",
+    "NCAAF": "ncaaf",
+}
+
+_RUNDOWN_TO_PM_SPORT: dict[str, str] = {
+    "NFL":    "nfl",
+    "NBA":    "nba",
+    "NCAAB":  "ncaab",
+    "MLB":    "mlb",
+    "NHL":    "nhl",
+    "NCAAWB": "ncaawb",
+    "MMA":    "mma",
+    "NCAAF":  "ncaaf",
 }
 
 _BOVADA_TO_DISPLAY_SPORT = {
@@ -45,21 +63,129 @@ _FUZZY_MATCH_THRESHOLD = 80.0
 
 # Tier-2 alias map for common shorthand/abbreviations.
 _TEAM_ALIAS_MAP: dict[str, str] = {
-    "mia": "miami heat",
-    "mia heat": "miami heat",
-    "nyk": "new york knicks",
-    "la lakers": "los angeles lakers",
-    "lal": "los angeles lakers",
-    "la clippers": "los angeles clippers",
-    "lac": "los angeles clippers",
-    "okc": "oklahoma city thunder",
-    "gsw": "golden state warriors",
-    "tb": "tampa bay buccaneers",
-    "ne": "new england patriots",
-    "sf": "san francisco 49ers",
-    "kc": "kansas city chiefs",
-    "wsh": "washington capitals",
-    "vgk": "vegas golden knights",
+    # --- NBA ---
+    "lakers": "los angeles lakers", "la lakers": "los angeles lakers", "lal": "los angeles lakers",
+    "clippers": "los angeles clippers", "la clippers": "los angeles clippers", "lac": "los angeles clippers",
+    "warriors": "golden state warriors", "gsw": "golden state warriors", "golden state": "golden state warriors",
+    "celtics": "boston celtics", "bos": "boston celtics", "boston": "boston celtics",
+    "heat": "miami heat", "mia": "miami heat", "mia heat": "miami heat", "miami": "miami heat",
+    "knicks": "new york knicks", "nyk": "new york knicks",
+    "nets": "brooklyn nets", "bkn": "brooklyn nets", "brooklyn": "brooklyn nets",
+    "76ers": "philadelphia 76ers", "sixers": "philadelphia 76ers", "phi": "philadelphia 76ers", "philadelphia": "philadelphia 76ers",
+    "bulls": "chicago bulls", "chi": "chicago bulls", "chicago": "chicago bulls",
+    "bucks": "milwaukee bucks", "mil": "milwaukee bucks", "milwaukee": "milwaukee bucks",
+    "raptors": "toronto raptors", "tor": "toronto raptors", "toronto": "toronto raptors",
+    "hawks": "atlanta hawks", "atl": "atlanta hawks", "atlanta": "atlanta hawks",
+    "cavaliers": "cleveland cavaliers", "cavs": "cleveland cavaliers", "cle": "cleveland cavaliers", "cleveland": "cleveland cavaliers",
+    "pacers": "indiana pacers", "ind": "indiana pacers", "indiana": "indiana pacers",
+    "pistons": "detroit pistons", "det": "detroit pistons", "detroit": "detroit pistons",
+    "magic": "orlando magic", "orl": "orlando magic", "orlando": "orlando magic",
+    "wizards": "washington wizards", "was": "washington wizards",
+    "hornets": "charlotte hornets", "cha": "charlotte hornets", "charlotte": "charlotte hornets",
+    "nuggets": "denver nuggets", "den": "denver nuggets", "denver": "denver nuggets",
+    "thunder": "oklahoma city thunder", "okc": "oklahoma city thunder", "oklahoma city": "oklahoma city thunder",
+    "trail blazers": "portland trail blazers", "blazers": "portland trail blazers", "por": "portland trail blazers", "portland": "portland trail blazers",
+    "jazz": "utah jazz", "uta": "utah jazz", "utah": "utah jazz",
+    "timberwolves": "minnesota timberwolves", "wolves": "minnesota timberwolves", "min": "minnesota timberwolves", "minnesota": "minnesota timberwolves",
+    "pelicans": "new orleans pelicans", "nop": "new orleans pelicans", "new orleans": "new orleans pelicans",
+    "rockets": "houston rockets", "hou": "houston rockets", "houston": "houston rockets",
+    "mavericks": "dallas mavericks", "mavs": "dallas mavericks", "dal": "dallas mavericks", "dallas": "dallas mavericks",
+    "grizzlies": "memphis grizzlies", "mem": "memphis grizzlies", "memphis": "memphis grizzlies",
+    "spurs": "san antonio spurs", "sas": "san antonio spurs", "san antonio": "san antonio spurs",
+    "kings": "sacramento kings", "sac": "sacramento kings", "sacramento": "sacramento kings",
+    "suns": "phoenix suns", "phx": "phoenix suns", "phoenix": "phoenix suns",
+    # --- NFL ---
+    "patriots": "new england patriots", "ne": "new england patriots",
+    "chiefs": "kansas city chiefs", "kc": "kansas city chiefs",
+    "bills": "buffalo bills", "buf": "buffalo bills", "buffalo": "buffalo bills",
+    "dolphins": "miami dolphins", "mia dolphins": "miami dolphins",
+    "jets": "new york jets", "nyj": "new york jets",
+    "giants": "new york giants", "nyg": "new york giants",
+    "eagles": "philadelphia eagles", "phi eagles": "philadelphia eagles",
+    "cowboys": "dallas cowboys", "dal cowboys": "dallas cowboys",
+    "commanders": "washington commanders", "wsh": "washington commanders",
+    "ravens": "baltimore ravens", "bal": "baltimore ravens", "baltimore": "baltimore ravens",
+    "steelers": "pittsburgh steelers", "pit": "pittsburgh steelers", "pittsburgh": "pittsburgh steelers",
+    "bengals": "cincinnati bengals", "cin": "cincinnati bengals", "cincinnati": "cincinnati bengals",
+    "browns": "cleveland browns", "cle browns": "cleveland browns",
+    "texans": "houston texans", "hou texans": "houston texans",
+    "colts": "indianapolis colts", "ind colts": "indianapolis colts", "indianapolis": "indianapolis colts",
+    "titans": "tennessee titans", "ten": "tennessee titans", "tennessee": "tennessee titans",
+    "jaguars": "jacksonville jaguars", "jax": "jacksonville jaguars", "jacksonville": "jacksonville jaguars",
+    "packers": "green bay packers", "gb": "green bay packers", "green bay": "green bay packers",
+    "bears": "chicago bears", "chi bears": "chicago bears",
+    "vikings": "minnesota vikings", "min vikings": "minnesota vikings",
+    "lions": "detroit lions", "det lions": "detroit lions",
+    "saints": "new orleans saints", "no": "new orleans saints",
+    "buccaneers": "tampa bay buccaneers", "bucs": "tampa bay buccaneers", "tb": "tampa bay buccaneers", "tampa bay": "tampa bay buccaneers",
+    "falcons": "atlanta falcons", "atl falcons": "atlanta falcons",
+    "panthers": "carolina panthers", "car": "carolina panthers", "carolina": "carolina panthers",
+    "49ers": "san francisco 49ers", "niners": "san francisco 49ers", "sf": "san francisco 49ers", "san francisco": "san francisco 49ers",
+    "seahawks": "seattle seahawks", "sea": "seattle seahawks", "seattle": "seattle seahawks",
+    "rams": "los angeles rams", "la rams": "los angeles rams",
+    "cardinals": "arizona cardinals", "ari": "arizona cardinals", "arizona": "arizona cardinals",
+    "chargers": "los angeles chargers", "la chargers": "los angeles chargers",
+    "broncos": "denver broncos", "den broncos": "denver broncos",
+    "raiders": "las vegas raiders", "lv": "las vegas raiders", "las vegas": "las vegas raiders",
+    # --- NHL ---
+    "bruins": "boston bruins", "bos bruins": "boston bruins",
+    "sabres": "buffalo sabres", "buf sabres": "buffalo sabres",
+    "flames": "calgary flames", "cgy": "calgary flames", "calgary": "calgary flames",
+    "hurricanes": "carolina hurricanes", "car hurricanes": "carolina hurricanes",
+    "blackhawks": "chicago blackhawks", "chi blackhawks": "chicago blackhawks",
+    "avalanche": "colorado avalanche", "col": "colorado avalanche", "colorado": "colorado avalanche",
+    "blue jackets": "columbus blue jackets", "cbj": "columbus blue jackets", "columbus": "columbus blue jackets",
+    "stars": "dallas stars", "dal stars": "dallas stars",
+    "red wings": "detroit red wings", "det red wings": "detroit red wings",
+    "oilers": "edmonton oilers", "edm": "edmonton oilers", "edmonton": "edmonton oilers",
+    "panthers nhl": "florida panthers", "fla": "florida panthers", "florida": "florida panthers",
+    "kings nhl": "los angeles kings", "la kings": "los angeles kings",
+    "wild": "minnesota wild", "min wild": "minnesota wild",
+    "canadiens": "montreal canadiens", "mtl": "montreal canadiens", "montreal": "montreal canadiens",
+    "predators": "nashville predators", "nsh": "nashville predators", "nashville": "nashville predators",
+    "devils": "new jersey devils", "njd": "new jersey devils",
+    "islanders": "new york islanders", "nyi": "new york islanders",
+    "rangers": "new york rangers", "nyr": "new york rangers",
+    "senators": "ottawa senators", "ott": "ottawa senators", "ottawa": "ottawa senators",
+    "flyers": "philadelphia flyers", "phi flyers": "philadelphia flyers",
+    "penguins": "pittsburgh penguins", "pit penguins": "pittsburgh penguins",
+    "sharks": "san jose sharks", "sjs": "san jose sharks", "san jose": "san jose sharks",
+    "kraken": "seattle kraken", "sea kraken": "seattle kraken",
+    "blues": "st louis blues", "stl": "st louis blues", "st louis": "st louis blues",
+    "lightning": "tampa bay lightning", "tbl": "tampa bay lightning", "tb lightning": "tampa bay lightning",
+    "maple leafs": "toronto maple leafs", "leafs": "toronto maple leafs", "tor leafs": "toronto maple leafs",
+    "canucks": "vancouver canucks", "van": "vancouver canucks", "vancouver": "vancouver canucks",
+    "golden knights": "vegas golden knights", "vgk": "vegas golden knights", "vegas": "vegas golden knights",
+    "capitals": "washington capitals", "wsh capitals": "washington capitals",
+    "jets nhl": "winnipeg jets", "wpg": "winnipeg jets", "winnipeg": "winnipeg jets",
+    # --- MLB ---
+    "yankees": "new york yankees", "nyy": "new york yankees",
+    "mets": "new york mets", "nym": "new york mets",
+    "red sox": "boston red sox", "bos red sox": "boston red sox",
+    "dodgers": "los angeles dodgers", "la dodgers": "los angeles dodgers",
+    "cubs": "chicago cubs", "chc": "chicago cubs",
+    "white sox": "chicago white sox", "cws": "chicago white sox",
+    "braves": "atlanta braves", "atl braves": "atlanta braves",
+    "astros": "houston astros", "hou astros": "houston astros",
+    "phillies": "philadelphia phillies", "phi phillies": "philadelphia phillies",
+    "padres": "san diego padres", "sd": "san diego padres", "san diego": "san diego padres",
+    "guardians": "cleveland guardians", "cle guardians": "cleveland guardians",
+    "mariners": "seattle mariners", "sea mariners": "seattle mariners",
+    "blue jays": "toronto blue jays", "tor blue jays": "toronto blue jays",
+    "twins": "minnesota twins", "min twins": "minnesota twins",
+    "brewers": "milwaukee brewers", "mil brewers": "milwaukee brewers",
+    "diamondbacks": "arizona diamondbacks", "ari dbacks": "arizona diamondbacks",
+    "reds": "cincinnati reds", "cin reds": "cincinnati reds",
+    "pirates": "pittsburgh pirates", "pit pirates": "pittsburgh pirates",
+    "royals": "kansas city royals", "kc royals": "kansas city royals",
+    "orioles": "baltimore orioles", "bal orioles": "baltimore orioles",
+    "rays": "tampa bay rays", "tb rays": "tampa bay rays",
+    "rockies": "colorado rockies", "col rockies": "colorado rockies",
+    "tigers": "detroit tigers", "det tigers": "detroit tigers",
+    "angels": "los angeles angels", "la angels": "los angeles angels", "laa": "los angeles angels",
+    "athletics": "oakland athletics", "as": "oakland athletics", "oak": "oakland athletics", "oakland": "oakland athletics",
+    "nationals": "washington nationals", "wsh nationals": "washington nationals",
+    "marlins": "miami marlins", "mia marlins": "miami marlins",
 }
 
 
@@ -105,12 +231,14 @@ class EventStore:
         self.cursors: dict[int, str] = {}
         # sport_id -> timestamp of last snapshot
         self.snapshot_ts: dict[int, float] = {}
+        # sport_id -> the date string (YYYY-MM-DD) used when the snapshot was last fetched
+        self.snapshot_dates: dict[int, str] = {}
         # Timestamp of the most recent successfully fetched data
         self.last_update_ts: float = 0.0
         # Datapoint budget tracking
         self.dp_remaining: str = "?"
 
-    def set_snapshot(self, sport_id: int, events: list[dict], cursor: str | None):
+    def set_snapshot(self, sport_id: int, events: list[dict], cursor: str | None, date_str: str = ""):
         with self._lock:
             by_id = {}
             for e in events:
@@ -121,6 +249,8 @@ class EventStore:
             if cursor:
                 self.cursors[sport_id] = cursor
             self.snapshot_ts[sport_id] = time.time()
+            if date_str:
+                self.snapshot_dates[sport_id] = date_str
             self.last_update_ts = time.time()
 
     def merge_delta_events(self, sport_id: int, delta_events: list[dict], new_cursor: str | None):
@@ -159,6 +289,16 @@ _STORE = EventStore()
 # serially (asyncio.to_thread, one at a time), so no locking is needed.
 _CLIENT = therundown.RundownClient(therundown.API_KEY, therundown.USE_RAPIDAPI)
 
+# Synthetic book IDs for prediction market / external sources
+KALSHI_BOOK_ID     = 9001
+POLYMARKET_BOOK_ID = 9002
+BOVADA_BOOK_ID     = 9003
+
+therundown.KNOWN_BOOKS[KALSHI_BOOK_ID]     = "Kalshi"
+therundown.KNOWN_BOOKS[POLYMARKET_BOOK_ID] = "Polymarket"
+therundown.KNOWN_BOOKS[BOVADA_BOOK_ID]     = "Bovada"
+therundown.ALLOWED_BOOK_NAMES.update({"kalshi", "polymarket", "bovada"})
+
 # Affiliate cache — /affiliates data changes at most monthly; refresh daily.
 _AFFILIATES_TTL: int = 86400
 _affiliates_last_fetched: float = 0.0
@@ -173,6 +313,9 @@ def _refresh_affiliates_if_stale() -> None:
     if fresh:
         merged = dict(therundown._KNOWN_BOOKS_FALLBACK)
         merged.update(fresh)
+        merged[KALSHI_BOOK_ID]     = "Kalshi"
+        merged[POLYMARKET_BOOK_ID] = "Polymarket"
+        merged[BOVADA_BOOK_ID]     = "Bovada"
         therundown.KNOWN_BOOKS = merged
         _affiliates_last_fetched = time.time()
         print(f"  AFFILIATES :: refreshed ({len(fresh)} books cached for {_AFFILIATES_TTL}s)")
@@ -192,7 +335,8 @@ def scan_arbs_once(sport_ids: list[int]) -> tuple[list[dict], list[dict], list[d
     _refresh_affiliates_if_stale()
 
     client = _CLIENT
-    today_dt = therundown.datetime.date.today()
+    _ET = ZoneInfo("America/New_York")
+    today_dt = datetime.now(_ET).date()
     today = today_dt.strftime("%Y-%m-%d")
     tomorrow = (today_dt + therundown.datetime.timedelta(days=1)).strftime("%Y-%m-%d")
 
@@ -243,7 +387,13 @@ def scan_arbs_once(sport_ids: list[int]) -> tuple[list[dict], list[dict], list[d
         for market in markets:
             if not isinstance(market, dict):
                 continue
-            if market.get("market_id") in therundown.PROP_MARKET_IDS:
+            # V2 may return market_id as either str or int.
+            try:
+                mid = int(market.get("market_id"))
+            except (TypeError, ValueError):
+                continue
+            if mid in therundown.PROP_MARKET_IDS:
+                market["market_id"] = mid
                 prop_markets.append(market)
         return prop_markets
 
@@ -272,78 +422,51 @@ def scan_arbs_once(sport_ids: list[int]) -> tuple[list[dict], list[dict], list[d
             tuple(sorted(line_values)[:10]),
         )
 
-    def _discover_sport_prop_market_ids(sport_id: int, date_str: str) -> set[int]:
-        """
-        Discover which prop markets are active for a sport/date and intersect
-        with our configured prop allowlist.
-        """
-        try:
-            payload = client.get_available_markets_by_date(date_str, offset="300") or {}
-            sport_markets = payload.get(str(sport_id)) or payload.get(sport_id) or []
-            out: set[int] = set()
-            for m in sport_markets:
-                if not isinstance(m, dict):
-                    continue
-                try:
-                    mid = int(m.get("id"))
-                except (TypeError, ValueError):
-                    continue
-                # Keep only configured prop IDs that are currently available.
-                if mid in therundown.PROP_MARKET_IDS and bool(m.get("proposition")):
-                    out.add(mid)
-            return out
-        except Exception as e:
-            print(f"  PROP DISCOVERY :: sport {sport_id} date={date_str} failed: {e}")
-            return set()
-
-    def _discover_event_prop_market_ids(event_refs: list[str]) -> set[int]:
-        """
-        Discover prop market IDs available for one event.
-        """
-        for ref in event_refs:
-            try:
-                catalog_payload = client.get_event_markets(ref) or []
-                rows = (
-                    catalog_payload
-                    if isinstance(catalog_payload, list)
-                    else (catalog_payload.get("markets") or catalog_payload.get("data") or [])
-                )
-                discovered: set[int] = set()
-                for row in rows:
-                    if not isinstance(row, dict):
-                        continue
-                    rid = row.get("id")
-                    try:
-                        rid_i = int(rid)
-                    except (TypeError, ValueError):
-                        continue
-                    if rid_i in therundown.PROP_MARKET_IDS:
-                        discovered.add(rid_i)
-                if discovered:
-                    return discovered
-            except Exception:
-                continue
-        return set()
-
     for sport_id in sport_ids:
-        # Only fetch a fresh snapshot if the store is stale or empty
-        if _STORE.needs_bootstrap(sport_id):
+        # Track whether we fetch a fresh snapshot this pass (vs. using cache).
+        did_bootstrap = _STORE.needs_bootstrap(sport_id)
+
+        if did_bootstrap:
             try:
                 data = client.get_events(sport_id, today)
                 events = (data or {}).get("events") or []
                 cursor = (data or {}).get("meta", {}).get("delta_last_id")
-                _STORE.set_snapshot(sport_id, events, cursor)
+                snap_date = today
+
+                if not events:
+                    # ET-today has zero events — fallback to ET-tomorrow immediately.
+                    print(
+                        f"  SNAPSHOT :: sport {sport_id} ET-today ({today}) returned 0 events"
+                        f" — fetching ET-tomorrow ({tomorrow})"
+                    )
+                    time.sleep(therundown.get_safe_delay())
+                    try:
+                        tmr_data = client.get_events(sport_id, tomorrow)
+                        tmr_events = (tmr_data or {}).get("events") or []
+                        tmr_cursor = (tmr_data or {}).get("meta", {}).get("delta_last_id")
+                        if tmr_events:
+                            events = tmr_events
+                            cursor = tmr_cursor
+                            snap_date = tomorrow
+                    except Exception as tmr_e:
+                        print(f"  SNAPSHOT :: sport {sport_id} ET-tomorrow fallback failed: {tmr_e}")
+
+                _STORE.set_snapshot(sport_id, events, cursor, snap_date)
                 _STORE.dp_remaining = client.last_headers.get("X-Datapoints-Remaining", "?")
-                print(f"  SNAPSHOT :: sport {sport_id} loaded {len(events)} events (cursor={str(cursor)[:12]}…)")
+                print(
+                    f"  SNAPSHOT :: sport {sport_id} loaded {len(events)} events"
+                    f" (date={snap_date}, cursor={str(cursor)[:12]}…)"
+                )
                 time.sleep(therundown.get_safe_delay())
             except Exception as e:
                 print(f"  SNAPSHOT :: sport {sport_id} failed: {e}")
                 time.sleep(therundown.get_safe_delay())
         else:
             age = int(time.time() - _STORE.snapshot_ts.get(sport_id, 0))
-            print(f"  SNAPSHOT :: sport {sport_id} using cached data ({age}s old, max {SNAPSHOT_MAX_AGE}s)")
+            snap_date = _STORE.snapshot_dates.get(sport_id, today)
+            print(f"  SNAPSHOT :: sport {sport_id} using cached data ({age}s old, max {SNAPSHOT_MAX_AGE}s, date={snap_date})")
 
-        # Try a delta poll to get any recent changes
+        # Delta poll — cheap price-change check.
         cursor = _STORE.cursors.get(sport_id)
         if cursor:
             try:
@@ -354,10 +477,33 @@ def scan_arbs_once(sport_ids: list[int]) -> tuple[list[dict], list[dict], list[d
                 _STORE.dp_remaining = client.last_headers.get("X-Datapoints-Remaining", "?")
 
                 if deltas:
-                    print(f"  DELTA :: sport {sport_id} got {len(deltas)} price changes (cursor → {str(new_cursor)[:12]}…)")
-                    # Markets delta returns individual price changes, not full events.
-                    # We need to re-fetch the full snapshot to get the merged state.
-                    # But we can update the cursor so the next snapshot is fresher.
+                    if did_bootstrap:
+                        # Snapshot is already fresh — delta prices already reflected.
+                        print(
+                            f"  DELTA :: sport {sport_id} got {len(deltas)} price changes "
+                            f"(snapshot already fresh, cursor → {str(new_cursor)[:12]}…)"
+                        )
+                    else:
+                        # Cached data + new prices -> re-fetch snapshot now.
+                        # Use the same date the snapshot was originally bootstrapped with.
+                        refresh_date = _STORE.snapshot_dates.get(sport_id, today)
+                        print(
+                            f"  DELTA :: sport {sport_id} got {len(deltas)} price changes "
+                            f"— refreshing snapshot ({refresh_date}) to incorporate updates"
+                        )
+                        time.sleep(therundown.get_safe_delay())
+                        try:
+                            refresh_data = client.get_events(sport_id, refresh_date)
+                            fresh_events = (refresh_data or {}).get("events") or []
+                            fresh_cursor = (refresh_data or {}).get("meta", {}).get("delta_last_id")
+                            _STORE.set_snapshot(sport_id, fresh_events, fresh_cursor or new_cursor, refresh_date)
+                            _STORE.dp_remaining = client.last_headers.get("X-Datapoints-Remaining", "?")
+                            print(
+                                f"  DELTA :: sport {sport_id} snapshot refreshed "
+                                f"({len(fresh_events)} events from {refresh_date}, cursor → {str(fresh_cursor or new_cursor)[:12]}…)"
+                            )
+                        except Exception as refresh_err:
+                            print(f"  DELTA :: sport {sport_id} snapshot refresh failed ({refresh_err})")
                 else:
                     print(f"  DELTA :: sport {sport_id} no changes (cursor → {str(new_cursor)[:12]}…)")
                 time.sleep(therundown.get_safe_delay())
@@ -374,134 +520,76 @@ def scan_arbs_once(sport_ids: list[int]) -> tuple[list[dict], list[dict], list[d
     for sport_id in sport_ids:
         events = _STORE.get_events(sport_id)
         sport_name = therundown.ALL_SPORTS.get(sport_id, str(sport_id))
+        # Use the date the store was bootstrapped with (ET-today or ET-tomorrow fallback).
+        analysis_date = _STORE.snapshot_dates.get(sport_id, today)
         active_events = _filter_active_events(events)
-        analysis_date = today
-
-        # If today's slate is fully started/closed, pull tomorrow and merge.
-        if not active_events:
-            try:
-                print(f"  FALLBACK :: {sport_name} had 0 active events for {today}, fetching {tomorrow}")
-                data_tmr = client.get_events(sport_id, tomorrow)
-                ev_tmr = (data_tmr or {}).get("events") or []
-                cur_tmr = (data_tmr or {}).get("meta", {}).get("delta_last_id")
-                merged = {e.get("event_id"): e for e in events if e.get("event_id")}
-                for e in ev_tmr:
-                    eid = e.get("event_id")
-                    if eid:
-                        merged[eid] = e
-                merged_events = list(merged.values())
-                _STORE.set_snapshot(sport_id, merged_events, cur_tmr or _STORE.cursors.get(sport_id))
-                _STORE.dp_remaining = client.last_headers.get("X-Datapoints-Remaining", "?")
-                active_events = _filter_active_events(merged_events)
-                analysis_date = tomorrow
-                time.sleep(therundown.get_safe_delay())
-            except Exception as e:
-                print(f"  FALLBACK :: {sport_name} tomorrow fetch failed: {e}")
 
         if len(events) != len(active_events):
-            print(f"  FILTER :: {sport_name}: {len(events)} total → {len(active_events)} active (dropped {len(events) - len(active_events)} started/finished)")
-
-        # ── V2-compliant prop enrichment ────────────────────────────────────
-        # 1) Discover available prop market IDs for this sport/date
-        # 2) Discover event-specific prop market IDs
-        # 3) Fetch props in <=12-ID chunks with two affiliate passes
-        # 4) Merge back into evt["markets"]
-        sport_prop_ids = _discover_sport_prop_market_ids(sport_id, analysis_date)
-        if sport_prop_ids:
             print(
-                f"  PROP DISCOVERY :: {sport_name} date={analysis_date} "
-                f"available_prop_ids={sorted(sport_prop_ids)}"
-            )
-        else:
-            print(
-                f"  PROP DISCOVERY :: {sport_name} date={analysis_date} no prop IDs "
-                f"from /sports/markets"
+                f"  FILTER :: {sport_name}: {len(events)} total → {len(active_events)} active"
+                f" (date={analysis_date}, dropped {len(events) - len(active_events)} started/finished)"
             )
 
-        enrich_events_with_props = 0
-        enrich_market_total = 0
-        for evt in active_events:
-            event_refs: list[str] = []
-            if evt.get("event_uuid"):
-                event_refs.append(str(evt.get("event_uuid")))
-            if evt.get("event_id"):
-                event_refs.append(str(evt.get("event_id")))
-            if not event_refs:
-                continue
+        # ── Prop market enrichment ───────────────────────────────────────────
+        # Fetch all prop markets for this sport/date in one API call.
+        try:
+            prop_data = client.get_prop_events(sport_id, analysis_date)
+            prop_events = (prop_data or {}).get("events") or []
 
-            event_prop_ids = _discover_event_prop_market_ids(event_refs)
-            target_prop_ids = sorted(event_prop_ids.intersection(sport_prop_ids) if sport_prop_ids else event_prop_ids)
-            if not target_prop_ids:
-                continue
-
-            chunks = therundown.chunk_market_ids(target_prop_ids, chunk_size=12)
-            evt_markets = evt.get("markets")
-            if not isinstance(evt_markets, list):
-                evt_markets = []
-            seen_signatures = {
-                _market_signature(m)
-                for m in evt_markets
-                if isinstance(m, dict)
-            }
-            merged_count_for_event = 0
-
-            for chunk in chunks:
-                fetched_chunk_markets: list[dict] = []
-
-                # Pass A: priority books only
-                for ref in event_refs:
+            # event_id -> prop markets
+            prop_markets_by_event: dict[str, list[dict]] = {}
+            for pe in prop_events:
+                eid = pe.get("event_id")
+                if not eid:
+                    continue
+                raw_markets = pe.get("markets") or []
+                prop_markets: list[dict] = []
+                for m in raw_markets:
+                    if not isinstance(m, dict):
+                        continue
                     try:
-                        payload = client.get_event_with_markets(
-                            ref,
-                            market_ids=chunk,
-                            affiliate_ids="22,19,23",
-                            main_line="false",  # keep alt lines
-                        ) or {}
-                        fetched_chunk_markets.extend(_extract_prop_markets_from_event_payload(payload))
-                        if fetched_chunk_markets:
-                            break
-                    except Exception:
+                        mid = int(m.get("market_id"))
+                    except (TypeError, ValueError):
                         continue
+                    if mid in therundown.PROP_MARKET_IDS:
+                        m["market_id"] = mid
+                        prop_markets.append(m)
+                if prop_markets:
+                    prop_markets_by_event[str(eid)] = prop_markets
 
-                # Pass B fallback: all available books
-                if not fetched_chunk_markets:
-                    for ref in event_refs:
-                        try:
-                            payload = client.get_event_with_markets(
-                                ref,
-                                market_ids=chunk,
-                                affiliate_ids=None,
-                                main_line="false",  # keep alt lines
-                            ) or {}
-                            fetched_chunk_markets.extend(_extract_prop_markets_from_event_payload(payload))
-                            if fetched_chunk_markets:
-                                break
-                        except Exception:
-                            continue
+            enrich_events_with_props = 0
+            enrich_market_total = 0
+            for evt in active_events:
+                eid = str(evt.get("event_id") or "")
+                if not eid or eid not in prop_markets_by_event:
+                    continue
 
-                for m in fetched_chunk_markets:
-                    sig = _market_signature(m)
-                    if sig in seen_signatures:
-                        continue
-                    evt_markets.append(m)
-                    seen_signatures.add(sig)
-                    merged_count_for_event += 1
+                existing_markets = evt.get("markets")
+                if not isinstance(existing_markets, list):
+                    existing_markets = []
 
-            evt["markets"] = evt_markets
-            if merged_count_for_event > 0:
-                enrich_events_with_props += 1
-                enrich_market_total += merged_count_for_event
-                if therundown.PROP_DIAGNOSTICS:
-                    print(
-                        f"  PROP EVENT :: {sport_name} eid={evt.get('event_id')} "
-                        f"event_prop_ids={sorted(event_prop_ids)} requested_chunks={chunks} "
-                        f"merged_markets={merged_count_for_event}"
-                    )
+                existing_sigs = {
+                    _market_signature(m)
+                    for m in existing_markets
+                    if isinstance(m, dict)
+                }
+                new_prop_markets = [
+                    m for m in prop_markets_by_event[eid]
+                    if _market_signature(m) not in existing_sigs
+                ]
+                if new_prop_markets:
+                    evt["markets"] = existing_markets + new_prop_markets
+                    enrich_events_with_props += 1
+                    enrich_market_total += len(new_prop_markets)
 
-        print(
-            f"  PROP ENRICH :: {sport_name} events_enriched={enrich_events_with_props}/{len(active_events)} "
-            f"markets_merged={enrich_market_total}"
-        )
+            print(
+                f"  PROP ENRICH :: {sport_name} api_events_with_props={len(prop_markets_by_event)} "
+                f"active_events_enriched={enrich_events_with_props}/{len(active_events)} "
+                f"markets_merged={enrich_market_total}"
+            )
+            time.sleep(therundown.get_safe_delay())
+        except Exception as e:
+            print(f"  PROP ENRICH :: {sport_name} failed ({e}) — continuing without props")
 
         books_in_batch: set[str] = set()
         prop_raw_count = 0
@@ -563,6 +651,9 @@ class ArbState:
         self.last_scan_ms: int | None = None
         self.last_error: str | None = None
         self.last_scan_sports: list[str] = []
+        self.kalshi_count: int = 0
+        self.poly_count:   int = 0
+        self.pm_error:     str | None = None
 
 
 async def handle_health(request: web.Request) -> web.Response:
@@ -628,9 +719,8 @@ def _team_match_score(a: str, b: str) -> float:
 
 def _normalize_rundown_events_for_matching(sport_ids: list[int]) -> list[dict[str, Any]]:
     """
-    Build a matching-friendly view of the latest TheRundown events in memory.
-    Shape aligns with bovada_scraper output:
-      sport, home_team, away_team, start_time, event_url, markets
+    Build a matching-friendly view of TheRundown events currently in the store.
+    Now also stores _raw_event for use by the cross-source arb engine.
     """
     normalized: list[dict[str, Any]] = []
     for sport_id in sport_ids:
@@ -643,17 +733,16 @@ def _normalize_rundown_events_for_matching(sport_ids: list[int]) -> list[dict[st
             if not home_team or not away_team:
                 continue
             start_time = event.get("event_date") or event.get("event_date_start") or ""
-            normalized.append(
-                {
-                    "source": "therundown",
-                    "sport": str(sport_name).lower(),
-                    "home_team": home_team,
-                    "away_team": away_team,
-                    "start_time": start_time,
-                    "event_url": "",
-                    "markets": therundown.compute_best_lines_for_event(event, sport_name),
-                }
-            )
+            normalized.append({
+                "source": "therundown",
+                "sport": str(sport_name).lower(),
+                "home_team": home_team,
+                "away_team": away_team,
+                "start_time": start_time,
+                "event_url": "",
+                "_raw_event": event,
+                "markets": therundown.compute_best_lines_for_event(event, sport_name),
+            })
     return normalized
 
 
@@ -675,6 +764,141 @@ async def _fetch_bovada_events_for_sports(selected_names: list[str]) -> list[dic
             continue
         events.extend(entry)
     return events
+
+
+async def _fetch_pm_events_for_sports(
+    selected_names: list[str],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """
+    Fetch Kalshi and Polymarket events for the selected sports.
+    Returns (kalshi_events, polymarket_events).
+    """
+    sport_keys = [
+        _RUNDOWN_TO_PM_SPORT[name]
+        for name in selected_names
+        if name in _RUNDOWN_TO_PM_SPORT
+    ]
+    if not sport_keys:
+        return [], []
+
+    kalshi_events, poly_events = await prediction_markets.fetch_all_prediction_markets(sport_keys)
+    return kalshi_events, poly_events
+
+
+def _match_source_to_hubs(
+    source_events: list[dict[str, Any]],
+    hub_events: list[dict[str, Any]],
+    source_name: str,
+) -> tuple[dict[int, list[dict]], list[dict[str, Any]]]:
+    """
+    Match source_events (bovada/kalshi/polymarket) to hub_events (TheRundown).
+
+    Uses the existing 3-tier match logic (normalize -> alias -> rapidfuzz >= 80).
+
+    Returns:
+        matched:    { hub_index: [market_dicts from source] }
+        unmatched:  source events with no hub counterpart
+    """
+    matched:   dict[int, list[dict]] = {}
+    unmatched: list[dict[str, Any]] = []
+    used_hub_indices: set[int] = set()
+
+    for src_event in source_events:
+        s_sport = str(src_event.get("sport", "")).lower()
+        s_home  = str(src_event.get("home_team", ""))
+        s_away  = str(src_event.get("away_team", ""))
+        if not s_home or not s_away:
+            continue
+
+        best_idx:    int | None = None
+        best_score             = -1.0
+        best_swapped           = False
+
+        for idx, hub in enumerate(hub_events):
+            if idx in used_hub_indices:
+                continue
+            if str(hub.get("sport", "")).lower() != s_sport:
+                continue
+
+            h_home = str(hub.get("home_team", ""))
+            h_away = str(hub.get("away_team", ""))
+            if not h_home or not h_away:
+                continue
+
+            direct_score  = min(_team_match_score(s_home, h_home), _team_match_score(s_away, h_away))
+            swapped_score = min(_team_match_score(s_home, h_away), _team_match_score(s_away, h_home))
+
+            if direct_score >= swapped_score:
+                cand_score, cand_swapped = direct_score, False
+            else:
+                cand_score, cand_swapped = swapped_score, True
+
+            if cand_score >= _FUZZY_MATCH_THRESHOLD and cand_score > best_score:
+                best_score, best_idx, best_swapped = cand_score, idx, cand_swapped
+
+        if best_idx is None:
+            unmatched.append(src_event)
+            continue
+
+        used_hub_indices.add(best_idx)
+
+        markets = list(src_event.get("markets") or [])
+        if best_swapped:
+            for m in markets:
+                sel = m.get("selection", "")
+                if sel == "home":
+                    m = {**m, "selection": "away"}
+                elif sel == "away":
+                    m = {**m, "selection": "home"}
+            logger.debug("%s: swapped home/away for %s vs %s", source_name, s_home, s_away)
+
+        matched.setdefault(best_idx, []).extend(markets)
+
+    return matched, unmatched
+
+
+def _merge_all_sources(
+    rundown_events:  list[dict[str, Any]],
+    bovada_events:   list[dict[str, Any]],
+    kalshi_events:   list[dict[str, Any]],
+    poly_events:     list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """
+    Match Bovada, Kalshi, and Polymarket events to TheRundown hubs.
+    Returns consolidated event list with books: {bovada, kalshi, polymarket} + _raw_event.
+    """
+    bovada_match,   _bovada_unmatched   = _match_source_to_hubs(bovada_events,  rundown_events, "bovada")
+    kalshi_match,   _kalshi_unmatched   = _match_source_to_hubs(kalshi_events,  rundown_events, "kalshi")
+    poly_match,     _poly_unmatched     = _match_source_to_hubs(poly_events,    rundown_events, "polymarket")
+
+    consolidated: list[dict[str, Any]] = []
+
+    for idx, hub in enumerate(rundown_events):
+        books = {
+            "bovada":     bovada_match.get(idx, []),
+            "kalshi":     kalshi_match.get(idx, []),
+            "polymarket": poly_match.get(idx, []),
+        }
+        if not any(books.values()):
+            continue
+
+        consolidated.append({
+            "sport":      hub.get("sport", ""),
+            "home_team":  hub.get("home_team", ""),
+            "away_team":  hub.get("away_team", ""),
+            "start_time": hub.get("start_time", ""),
+            "_raw_event": hub.get("_raw_event"),
+            "books":      books,
+        })
+
+    logger.info(
+        "Merged %d cross-source events (bovada:%d, kalshi:%d, poly:%d matched hubs)",
+        len(consolidated),
+        sum(1 for v in bovada_match.values() if v),
+        sum(1 for v in kalshi_match.values() if v),
+        sum(1 for v in poly_match.values() if v),
+    )
+    return consolidated
 
 
 def _match_intersection_events(
@@ -811,7 +1035,7 @@ def _bovada_events_to_raw_lines(bovada_events: list[dict[str, Any]]) -> list[dic
                     "market_kind": market_kind,
                     "line_label": line_label,
                     "side": side_map.get(str(market.get("selection", "")).lower(), str(market.get("selection", "")).title()),
-                    "book": "bovada",
+                    "book": "Bovada",
                     "odds_am": odds_am,
                     "updated_at": None,
                 }
@@ -845,8 +1069,8 @@ def _bovada_events_to_best_lines(bovada_events: list[dict[str, Any]]) -> list[di
                     "game": game,
                     "home_team": home_team,
                     "away_team": away_team,
-                    "home": {"book": "bovada", "odds_am": int(moneyline_home["american_odds"])},
-                    "away": {"book": "bovada", "odds_am": int(moneyline_away["american_odds"])},
+                    "home": {"book": "Bovada", "odds_am": int(moneyline_home["american_odds"])},
+                    "away": {"book": "Bovada", "odds_am": int(moneyline_away["american_odds"])},
                 }
             )
 
@@ -868,7 +1092,7 @@ def _bovada_events_to_best_lines(bovada_events: list[dict[str, Any]]) -> list[di
                     "team": team,
                     "sport": sport,
                     "game": game,
-                    "pick": {"book": "bovada", "odds_am": odds_am},
+                    "pick": {"book": "Bovada", "odds_am": odds_am},
                 }
             )
 
@@ -898,12 +1122,643 @@ def _bovada_events_to_best_lines(bovada_events: list[dict[str, Any]]) -> list[di
                     "line": line_value,
                     "sport": sport,
                     "game": game,
-                    "over": {"book": "bovada", "odds_am": int(best_over["american_odds"])},
-                    "under": {"book": "bovada", "odds_am": int(best_under["american_odds"])},
+                    "over": {"book": "Bovada", "odds_am": int(best_over["american_odds"])},
+                    "under": {"book": "Bovada", "odds_am": int(best_under["american_odds"])},
                 }
             )
 
     return best_lines
+
+
+# ──────────────────────────────────────────────
+# UNIFIED GAME POOL (PRD v1.0)
+# ──────────────────────────────────────────────
+
+def _norm(name: str) -> str:
+    """Thin wrapper — reuses existing _normalize_team_name."""
+    return _normalize_team_name(name or "")
+
+
+def _flat_markets_to_nested(flat_markets: list[dict], book_id: int) -> list[dict]:
+    """
+    Convert flat Kalshi/Polymarket/Bovada market dicts into the nested
+    participants -> lines -> prices shape that build_market_index expects.
+    """
+    nested: list[dict] = []
+    now = datetime.now(timezone.utc).isoformat()
+    bid = str(book_id)
+
+    ml_home = next((m for m in flat_markets
+                    if str(m.get("market_type", "")).lower() == "moneyline"
+                    and str(m.get("selection", "")).lower() == "home"), None)
+    ml_away = next((m for m in flat_markets
+                    if str(m.get("market_type", "")).lower() == "moneyline"
+                    and str(m.get("selection", "")).lower() == "away"), None)
+    if ml_home and ml_away:
+        nested.append({
+            "market_id": 1,
+            "period_id": 0,
+            "name": "moneyline",
+            "participants": [
+                {"name": "Away", "lines": [{"prices": {bid: {
+                    "price": ml_away["american_odds"],
+                    "updated_at": ml_away.get("updated_at") or now,
+                }}}]},
+                {"name": "Home", "lines": [{"prices": {bid: {
+                    "price": ml_home["american_odds"],
+                    "updated_at": ml_home.get("updated_at") or now,
+                }}}]},
+            ],
+        })
+
+    spread_by_abs: dict[float, dict[str, dict]] = {}
+    total_by_line: dict[float, dict[str, dict]] = {}
+    for m in flat_markets:
+        mt = str(m.get("market_type", "")).lower()
+        sel = str(m.get("selection", "")).lower()
+        lv = m.get("line_value")
+        if mt == "spread" and lv is not None and sel in ("home", "away"):
+            try:
+                spread_by_abs.setdefault(abs(float(lv)), {})[sel] = m
+            except (TypeError, ValueError):
+                pass
+        elif mt == "total" and lv is not None and sel in ("over", "under"):
+            try:
+                total_by_line.setdefault(float(lv), {})[sel] = m
+            except (TypeError, ValueError):
+                pass
+
+    for abs_lv, sides in spread_by_abs.items():
+        sp_home = sides.get("home")
+        sp_away = sides.get("away")
+        if not sp_home or not sp_away:
+            continue
+        home_lv = float(sp_home.get("line_value", -abs_lv))
+        away_lv = float(sp_away.get("line_value", abs_lv))
+        nested.append({
+            "market_id": 2,
+            "period_id": 0,
+            "name": "spread",
+            "participants": [
+                {"name": "Away", "lines": [{"value": away_lv, "prices": {bid: {
+                    "price": sp_away["american_odds"],
+                    "updated_at": sp_away.get("updated_at") or now,
+                }}}]},
+                {"name": "Home", "lines": [{"value": home_lv, "prices": {bid: {
+                    "price": sp_home["american_odds"],
+                    "updated_at": sp_home.get("updated_at") or now,
+                }}}]},
+            ],
+        })
+
+    for lv, sides in total_by_line.items():
+        t_over = sides.get("over")
+        t_under = sides.get("under")
+        if not t_over or not t_under:
+            continue
+        nested.append({
+            "market_id": 3,
+            "period_id": 0,
+            "name": "total",
+            "participants": [
+                {"name": "Over", "lines": [{"value": lv, "prices": {bid: {
+                    "price": t_over["american_odds"],
+                    "updated_at": t_over.get("updated_at") or now,
+                }}}]},
+                {"name": "Under", "lines": [{"value": lv, "prices": {bid: {
+                    "price": t_under["american_odds"],
+                    "updated_at": t_under.get("updated_at") or now,
+                }}}]},
+            ],
+        })
+
+    return nested
+
+
+def _inject_matching_markets(
+    bucket:        dict,
+    source_events: list[dict],
+    rd_home:       str,
+    rd_away:       str,
+    threshold:     int,
+    book_id:       int,
+) -> None:
+    """
+    Find the best-matching event in source_events for (rd_home, rd_away)
+    and append its markets (converted to nested format) into the enriched
+    event's markets list.  Handles home/away swap.
+    """
+    best_score  = 0
+    best_markets: list[dict] = []
+    best_swapped = False
+
+    for src in source_events:
+        sh = _norm(src.get("home_team") or "")
+        sa = _norm(src.get("away_team") or "")
+        if not sh or not sa:
+            continue
+
+        score_normal  = min(_team_match_score(rd_home, sh), _team_match_score(rd_away, sa))
+        score_swapped = min(_team_match_score(rd_home, sa), _team_match_score(rd_away, sh))
+        top = max(score_normal, score_swapped)
+
+        if top > best_score:
+            best_score   = top
+            best_markets = list(src.get("markets") or [])
+            best_swapped = score_swapped > score_normal
+
+    if best_score < threshold or not best_markets:
+        return
+
+    if best_swapped:
+        flip = {"home": "away", "away": "home"}
+        best_markets = [
+            {**m, "selection": flip.get(m.get("selection"), m.get("selection"))}
+            for m in best_markets
+        ]
+
+    nested_markets = _flat_markets_to_nested(best_markets, book_id)
+    enriched = bucket["_enriched_event"]
+    existing = enriched.get("markets") or []
+    if not isinstance(existing, list):
+        existing = []
+    enriched["markets"] = existing + nested_markets
+
+    src_name = therundown.KNOWN_BOOKS.get(book_id, "unknown")
+    print(
+        f"  MATCH [{src_name}] score={best_score:.0f}: "
+        f"{bucket['home_team']} vs {bucket['away_team']}"
+        + (" [swapped]" if best_swapped else "")
+    )
+
+
+def _build_unified_game_pool(
+    rundown_events: list[dict],
+    bovada_events:  list[dict],
+    kalshi_events:  list[dict],
+    poly_events:    list[dict],
+    match_threshold: int = 75,
+) -> list[dict]:
+    """
+    Match events across all 4 sources into unified game buckets.
+
+    Each bucket wraps a shallow copy of the TheRundown raw event (the anchor)
+    and injects nested-format markets from every matched source so
+    therundown.analyze_event can process them all in one pass.
+    """
+    buckets: list[dict] = []
+
+    for rd_evt in rundown_events:
+        rd_home = _norm(rd_evt.get("home_team") or "")
+        rd_away = _norm(rd_evt.get("away_team") or "")
+        if not rd_home or not rd_away:
+            continue
+
+        raw_event = rd_evt.get("_raw_event")
+        if not raw_event:
+            continue
+
+        enriched_event = dict(raw_event)
+        enriched_event["markets"] = list(raw_event.get("markets") or [])
+
+        bucket = {
+            "sport":      rd_evt.get("sport", ""),
+            "home_team":  rd_evt.get("home_team", ""),
+            "away_team":  rd_evt.get("away_team", ""),
+            "start_time": rd_evt.get("start_time"),
+            "_enriched_event": enriched_event,
+        }
+
+        for source_list, bid in [
+            (bovada_events, BOVADA_BOOK_ID),
+            (kalshi_events, KALSHI_BOOK_ID),
+            (poly_events, POLYMARKET_BOOK_ID),
+        ]:
+            _inject_matching_markets(bucket, source_list, rd_home, rd_away,
+                                     match_threshold, bid)
+
+        buckets.append(bucket)
+
+    return buckets
+
+
+def _run_arbs_on_pool(
+    buckets: list[dict],
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """
+    Run therundown.analyze_event on every unified game bucket.
+    Returns (all_arbs, all_raw_lines, all_best_lines).
+    Only returns true arbs (profit > 0).
+    """
+    all_arbs:  list[dict] = []
+    all_lines: list[dict] = []
+    all_best:  list[dict] = []
+
+    for bucket in buckets:
+        sport_name = str(bucket.get("sport", "")).upper()
+        enriched_event = bucket.get("_enriched_event")
+        if not enriched_event:
+            continue
+
+        arbs, raw_lines = therundown.analyze_event(enriched_event, sport_name)
+        true_arbs = [a for a in arbs if a.get("profit", 0) > 0]
+        all_arbs.extend(true_arbs)
+        all_lines.extend(raw_lines)
+
+        best = therundown.compute_best_lines_for_event(enriched_event, sport_name)
+        all_best.extend(best)
+
+    return all_arbs, all_lines, all_best
+
+
+def _dedup_arbs(arbs: list[dict]) -> list[dict]:
+    """
+    Deduplicate by (game, market_kind, line_label, {book_a, book_b}, {side_a, side_b}).
+    Keeps the higher-profit record when duplicates exist.
+    Books and sides are treated as unordered pairs.
+    """
+    seen: dict[tuple, dict] = {}
+    for arb in arbs:
+        books = tuple(sorted([arb.get("book_a", ""), arb.get("book_b", "")]))
+        sides = tuple(sorted([arb.get("side_a", ""), arb.get("side_b", "")]))
+        key = (
+            arb.get("game", ""),
+            arb.get("market_kind", ""),
+            arb.get("line_label", ""),
+            books,
+            sides,
+        )
+        existing = seen.get(key)
+        if existing is None or arb.get("profit", 0) > existing.get("profit", 0):
+            seen[key] = arb
+    return list(seen.values())
+
+
+# ──────────────────────────────────────────────
+# CROSS-SOURCE ARB ENGINE
+# ──────────────────────────────────────────────
+
+def _market_dict_to_price_entry(
+    market: dict[str, Any],
+    book_name: str,
+    fetch_ts: str,
+) -> tuple[tuple, str, dict] | None:
+    """
+    Convert a bovada/PM market dict to a per_line index entry.
+
+    Returns (index_key, side, price_entry) or None if invalid.
+
+    index_key = ("ml" | "spread" | "total", line_value | None)
+    side      = "home" | "away" | "over" | "under"
+    price_entry = {"book": str, "price_am": int|float, "price_dec": float, "updated_at": str}
+    """
+    mtype = str(market.get("market_type") or "").lower()
+    sel   = str(market.get("selection")   or "").lower()
+
+    if mtype == "moneyline":
+        kind       = "ml"
+        line_value = None
+    elif mtype == "spread":
+        kind       = "spread"
+        line_value = market.get("line_value")
+    elif mtype == "total":
+        kind       = "total"
+        line_value = market.get("line_value")
+    else:
+        return None
+
+    if sel not in ("home", "away", "over", "under"):
+        return None
+
+    price_am  = market.get("american_odds")
+    price_dec = market.get("decimal_odds")
+
+    if price_dec is None or price_am is None:
+        return None
+    try:
+        price_dec = float(price_dec)
+        price_am  = int(round(float(price_am)))
+    except (TypeError, ValueError):
+        return None
+    if price_dec <= 1.0:
+        return None
+
+    updated_at = market.get("updated_at") or fetch_ts
+
+    index_key   = (kind, line_value)
+    price_entry = {
+        "book":       book_name,
+        "price_am":   price_am,
+        "price_dec":  price_dec,
+        "updated_at": updated_at,
+    }
+    return index_key, sel, price_entry
+
+
+def _build_cross_source_per_line_index(
+    consolidated: dict[str, Any],
+    fetch_ts: str,
+) -> tuple[dict, dict]:
+    """
+    Build a unified per_line index from all sources for one consolidated event.
+
+    TheRundown prices come from build_market_index() on the raw event.
+    Bovada/Kalshi/Polymarket prices come from their market dicts.
+
+    Returns (per_line_index, spread_pairs) matching the format that
+    therundown.analyze_event already uses.
+    """
+    per_line: dict[tuple, dict[str, list]] = {}
+    spread_pairs: dict[float, dict[str, list]] = {}
+
+    def _add(index_key, side, entry):
+        bucket = per_line.setdefault(index_key, {"home": [], "away": [], "over": [], "under": []})
+        if not any(e["book"] == entry["book"] for e in bucket.get(side, [])):
+            bucket[side].append(entry)
+            kind, lv = index_key
+            if kind == "spread" and lv is not None:
+                abs_lv = abs(lv)
+                sp = spread_pairs.setdefault(abs_lv, {"home_minus": [], "away_plus": []})
+                if side == "home" and lv < 0:
+                    sp["home_minus"].append(entry)
+                elif side == "away" and lv > 0:
+                    sp["away_plus"].append(entry)
+
+    raw_event = consolidated.get("_raw_event")
+    if raw_event:
+        try:
+            td_index, td_spread_pairs, _, _ = therundown.build_market_index(raw_event)
+            for (kind, lv), sides in td_index.items():
+                for side_key, entries in sides.items():
+                    for entry in entries:
+                        _add((kind, lv), side_key, entry)
+            for abs_lv, buckets in td_spread_pairs.items():
+                sp = spread_pairs.setdefault(abs_lv, {"home_minus": [], "away_plus": []})
+                for sub_key, sub_entries in buckets.items():
+                    sp[sub_key].extend(e for e in sub_entries
+                                       if not any(x["book"] == e["book"] for x in sp[sub_key]))
+        except Exception as e:
+            logger.warning("build_market_index failed for %s: %s", consolidated.get("home_team"), e)
+
+    _BOOK_LABELS = {
+        "bovada":     "Bovada",
+        "kalshi":     "Kalshi",
+        "polymarket": "Polymarket",
+    }
+    for source_key, book_label in _BOOK_LABELS.items():
+        for market in consolidated.get("books", {}).get(source_key) or []:
+            result = _market_dict_to_price_entry(market, book_label, fetch_ts)
+            if result:
+                index_key, side, entry = result
+                _add(index_key, side, entry)
+
+    return per_line, spread_pairs
+
+
+_RUNDOWN_BOOKS: frozenset[str] = frozenset({
+    "BetMGM", "FanDuel", "DraftKings",
+    "Sportsbetting", "BetOnline", "LowVig",
+    "Unibet", "YouWager", "Intertops", "Matchbook",
+})
+
+
+def _run_cross_source_arb_for_event(
+    consolidated: dict[str, Any],
+    sport_name: str,
+    fetch_ts: str,
+) -> tuple[list[dict], list[dict]]:
+    """
+    Run cross-source arb detection for one consolidated event.
+
+    Returns (arbs, raw_lines).
+    Only arbs where at least one leg is from Bovada/Kalshi/Polymarket are returned
+    (to avoid duplicating intra-Rundown arbs from scan_arbs_once).
+    """
+    try:
+        game, home_name, away_name = therundown._resolve_teams(consolidated.get("_raw_event") or {})
+    except Exception:
+        home_name = consolidated.get("home_team", "?")
+        away_name = consolidated.get("away_team", "?")
+        game = f"{away_name} @ {home_name}"
+
+    per_line, spread_pairs = _build_cross_source_per_line_index(consolidated, fetch_ts)
+    if not per_line:
+        return [], []
+
+    arbs: list[dict] = []
+    raw_lines: list[dict] = []
+
+    now_utc = datetime.now(timezone.utc)
+
+    def _parse_ts(val):
+        try:
+            if not val:
+                return None
+            if isinstance(val, (int, float)):
+                ts = float(val)
+                if ts > 1e10:
+                    ts /= 1000
+                return datetime.fromtimestamp(ts, tz=timezone.utc)
+            return datetime.fromisoformat(str(val).replace("Z", "+00:00"))
+        except Exception:
+            return None
+
+    def _is_external(book: str) -> bool:
+        return book not in _RUNDOWN_BOOKS
+
+    for (kind, line_value), sides in per_line.items():
+        if kind == "ml":
+            side_a_key, side_b_key = "home", "away"
+            label = "Moneyline"
+            market_line_label = "ML"
+        elif kind == "total":
+            side_a_key, side_b_key = "over", "under"
+            lbl = f"{line_value:g}" if line_value is not None else ""
+            label = f"Total {lbl}"
+            market_line_label = lbl
+        else:
+            continue
+
+        for side_key, side_display in [(side_a_key, side_a_key.capitalize()), (side_b_key, side_b_key.capitalize())]:
+            for entry in sides.get(side_key) or []:
+                raw_lines.append({
+                    "sport":       sport_name,
+                    "game":        game,
+                    "market_kind": kind,
+                    "line_label":  market_line_label,
+                    "side":        side_display,
+                    "book":        entry["book"],
+                    "odds_am":     entry["price_am"],
+                    "updated_at":  entry.get("updated_at"),
+                })
+
+        side_a_list = sides.get(side_a_key) or []
+        side_b_list = sides.get(side_b_key) or []
+        if not side_a_list or not side_b_list:
+            continue
+
+        best_a = max(side_a_list, key=lambda e: e["price_dec"])
+        best_b = max(side_b_list, key=lambda e: e["price_dec"])
+
+        ts_a = _parse_ts(best_a.get("updated_at"))
+        ts_b = _parse_ts(best_b.get("updated_at"))
+        if ts_a is None or ts_b is None:
+            continue
+        if (now_utc - ts_a).total_seconds() > therundown.ARB_MAX_LINE_AGE_S:
+            continue
+        if (now_utc - ts_b).total_seconds() > therundown.ARB_MAX_LINE_AGE_S:
+            continue
+
+        # Skip if both legs are pure Rundown books
+        if not _is_external(best_a["book"]) and not _is_external(best_b["book"]):
+            continue
+
+        dec_a  = best_a["price_dec"]
+        dec_b  = best_b["price_dec"]
+        arb    = (1 / dec_a) + (1 / dec_b)
+        profit = round((1 - arb) * 100, 4)
+
+        if profit < therundown.ARB_THRESHOLD:
+            continue
+        if profit > therundown.MAX_PROFIT_CAP:
+            continue
+
+        stake_a = round(therundown.TOTAL_STAKE * (1 / dec_a) / arb, 2)
+        stake_b = round(therundown.TOTAL_STAKE * (1 / dec_b) / arb, 2)
+
+        ts_list = [t for t in (ts_a, ts_b) if t is not None]
+        fresh_age_s = max((now_utc - t).total_seconds() for t in ts_list) if ts_list else None
+        stale_age_s = min((now_utc - t).total_seconds() for t in ts_list) if ts_list else None
+
+        arbs.append({
+            "sport":        sport_name,
+            "game":         game,
+            "market_kind":  kind,
+            "market_label": label,
+            "line_value":   line_value,
+            "line_label":   market_line_label,
+            "side_a":       side_a_key.capitalize(),
+            "book_a":       best_a["book"],
+            "odds_a_am":    best_a["price_am"],
+            "odds_a_dec":   dec_a,
+            "updated_at_a": best_a.get("updated_at"),
+            "side_b":       side_b_key.capitalize(),
+            "book_b":       best_b["book"],
+            "odds_b_am":    best_b["price_am"],
+            "odds_b_dec":   dec_b,
+            "updated_at_b": best_b.get("updated_at"),
+            "arb_pct":      round(arb, 6),
+            "profit":       profit,
+            "stake_a":      stake_a,
+            "stake_b":      stake_b,
+            "is_arb":       profit > 0,
+            "fresh_age_s":  fresh_age_s,
+            "stale_age_s":  stale_age_s,
+            "same_book":    best_a["book"] == best_b["book"],
+        })
+
+    for abs_lv, buckets in spread_pairs.items():
+        home_minus = buckets.get("home_minus") or []
+        away_plus  = buckets.get("away_plus")  or []
+
+        for entry in home_minus:
+            raw_lines.append({
+                "sport":       sport_name,
+                "game":        game,
+                "market_kind": "spread",
+                "line_label":  f"{abs_lv:g}",
+                "side":        "Home",
+                "book":        entry["book"],
+                "odds_am":     entry["price_am"],
+                "updated_at":  entry.get("updated_at"),
+            })
+        for entry in away_plus:
+            raw_lines.append({
+                "sport":       sport_name,
+                "game":        game,
+                "market_kind": "spread",
+                "line_label":  f"{abs_lv:g}",
+                "side":        "Away",
+                "book":        entry["book"],
+                "odds_am":     entry["price_am"],
+                "updated_at":  entry.get("updated_at"),
+            })
+
+        if not home_minus or not away_plus:
+            continue
+
+        best_home = max(home_minus, key=lambda e: e["price_dec"])
+        best_away = max(away_plus,  key=lambda e: e["price_dec"])
+
+        ts_home = _parse_ts(best_home.get("updated_at"))
+        ts_away = _parse_ts(best_away.get("updated_at"))
+        if ts_home is None or ts_away is None:
+            continue
+        if (now_utc - ts_home).total_seconds() > therundown.ARB_MAX_LINE_AGE_S:
+            continue
+        if (now_utc - ts_away).total_seconds() > therundown.ARB_MAX_LINE_AGE_S:
+            continue
+
+        if not _is_external(best_home["book"]) and not _is_external(best_away["book"]):
+            continue
+
+        dec_h  = best_home["price_dec"]
+        dec_a  = best_away["price_dec"]
+        arb    = (1 / dec_h) + (1 / dec_a)
+        profit = round((1 - arb) * 100, 4)
+
+        if profit < therundown.ARB_THRESHOLD or profit > therundown.MAX_PROFIT_CAP:
+            continue
+
+        stake_h = round(therundown.TOTAL_STAKE * (1 / dec_h) / arb, 2)
+        stake_a = round(therundown.TOTAL_STAKE * (1 / dec_a) / arb, 2)
+
+        arbs.append({
+            "sport":        sport_name,
+            "game":         game,
+            "market_kind":  "spread",
+            "market_label": f"Spread {abs_lv:g}",
+            "line_value":   abs_lv,
+            "line_label":   f"{abs_lv:g}",
+            "side_a":       "Home",
+            "book_a":       best_home["book"],
+            "odds_a_am":    best_home["price_am"],
+            "odds_a_dec":   dec_h,
+            "updated_at_a": best_home.get("updated_at"),
+            "side_b":       "Away",
+            "book_b":       best_away["book"],
+            "odds_b_am":    best_away["price_am"],
+            "odds_b_dec":   dec_a,
+            "updated_at_b": best_away.get("updated_at"),
+            "arb_pct":      round(arb, 6),
+            "profit":       profit,
+            "stake_a":      stake_h,
+            "stake_b":      stake_a,
+            "is_arb":       profit > 0,
+            "fresh_age_s":  None,
+            "stale_age_s":  None,
+            "same_book":    best_home["book"] == best_away["book"],
+        })
+
+    return arbs, raw_lines
+
+
+def _run_all_cross_source_arbs(
+    consolidated_events: list[dict[str, Any]],
+) -> tuple[list[dict], list[dict]]:
+    """Run cross-source arb engine over all matched events."""
+    all_arbs:  list[dict] = []
+    all_lines: list[dict] = []
+    fetch_ts = datetime.now(timezone.utc).isoformat()
+
+    for event in consolidated_events:
+        sport = str(event.get("sport") or "").upper()
+        arbs, lines = _run_cross_source_arb_for_event(event, sport, fetch_ts)
+        all_arbs.extend(arbs)
+        all_lines.extend(lines)
+
+    all_arbs.sort(key=lambda r: r.get("profit", 0), reverse=True)
+    return all_arbs, all_lines
 
 
 async def handle_scan_now(request: web.Request) -> web.Response:
@@ -915,11 +1770,13 @@ async def handle_scan_now(request: web.Request) -> web.Response:
 
     sports = payload.get("sports") if isinstance(payload, dict) else None
     if not isinstance(sports, list):
-        return web.json_response({"ok": False, "error": "Expected JSON body: {\"sports\": [\"NBA\", ...]}"},
-                                 status=400)
+        return web.json_response(
+            {"ok": False, "error": 'Expected JSON body: {"sports": ["NBA", ...]}'},
+            status=400,
+        )
 
-    name_to_id = _sport_id_by_name()
-    selected_ids: list[int] = []
+    name_to_id      = _sport_id_by_name()
+    selected_ids:   list[int] = []
     selected_names: list[str] = []
     for s in sports:
         if not isinstance(s, str):
@@ -932,66 +1789,125 @@ async def handle_scan_now(request: web.Request) -> web.Response:
 
     if not selected_ids:
         return web.json_response(
-            {"ok": False, "error": "No valid sports selected", "supported": list(_sport_id_by_name().keys())},
+            {"ok": False, "error": "No valid sports selected",
+             "supported": list(name_to_id.keys())},
             status=400,
         )
 
     try:
         state.last_error = None
+
+        # ── Step 1: Fetch all 4 sources concurrently ──────────────────
         rundown_task = asyncio.to_thread(scan_arbs_once, selected_ids)
-        bovada_task = asyncio.wait_for(
+        bovada_task  = asyncio.wait_for(
             _fetch_bovada_events_for_sports(selected_names),
-            timeout=10.0,
-        )
-        rundown_result, bovada_result = await asyncio.gather(
-            rundown_task,
-            bovada_task,
-            return_exceptions=True,
+            timeout=15.0,
         )
 
+        pm_errors: list[str] = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            kalshi_future = pool.submit(fetch_kalshi_markets)
+            poly_future   = pool.submit(fetch_polymarket_markets)
+
+            rundown_result, bovada_result = await asyncio.gather(
+                rundown_task, bovada_task, return_exceptions=True,
+            )
+
+            try:
+                kalshi_events: list[dict[str, Any]] = kalshi_future.result(timeout=12) or []
+            except Exception as e:
+                print(f"KALSHI_WARN: {e}")
+                kalshi_events = []
+                pm_errors.append(f"Kalshi: {e}")
+
+            try:
+                poly_events: list[dict[str, Any]] = poly_future.result(timeout=14) or []
+            except Exception as e:
+                print(f"POLYMARKET_WARN: {e}")
+                poly_events = []
+                pm_errors.append(f"Polymarket: {e}")
+
+        print(
+            f"SOURCES: TheRundown=ok  "
+            f"Bovada={'ok' if not isinstance(bovada_result, Exception) else 'FAIL'}  "
+            f"Kalshi={len(kalshi_events)} events  "
+            f"Polymarket={len(poly_events)} events"
+        )
+
+        # ── Step 2: Unpack TheRundown result ──────────────────────────
         if isinstance(rundown_result, Exception):
             raise rundown_result
 
-        arbs, lines, best_lines = rundown_result
+        rd_arbs, rd_lines, rd_best = rundown_result
+
         bovada_error: str | None = None
         bovada_events: list[dict[str, Any]] = []
         if isinstance(bovada_result, Exception):
             bovada_error = str(bovada_result)
-            logger.warning("Bovada scan failed or timed out: %s", bovada_error)
+            logger.warning("Bovada scan failed: %s", bovada_error)
         else:
-            bovada_events = bovada_result
+            bovada_events = bovada_result or []
 
+        pm_error: str | None = "; ".join(pm_errors) if pm_errors else None
+
+        # ── Step 3: Build unified game pool + cross-source arb engine ─
         rundown_events = _normalize_rundown_events_for_matching(selected_ids)
-        matched_games = _match_intersection_events(bovada_events, rundown_events)
-        bovada_lines = _bovada_events_to_raw_lines(bovada_events)
+
+        game_pool = _build_unified_game_pool(
+            rundown_events=rundown_events,
+            bovada_events=bovada_events,
+            kalshi_events=kalshi_events,
+            poly_events=poly_events,
+        )
+
+        cross_arbs, cross_lines, cross_best = _run_arbs_on_pool(game_pool)
+
+        # ── Step 4: Merge, dedup, store ───────────────────────────────
         bovada_best_lines = _bovada_events_to_best_lines(bovada_events)
 
-        state.arbs = arbs
-        state.lines = lines + bovada_lines
-        state.best_lines = best_lines + bovada_best_lines
-        state.last_scan_ms = _now_ms()
+        state.arbs       = _dedup_arbs(rd_arbs + cross_arbs)
+        state.lines      = rd_lines + cross_lines
+        state.best_lines = rd_best + bovada_best_lines + cross_best
+        state.last_scan_ms     = _now_ms()
         state.last_scan_sports = selected_names
-        resp = web.json_response(
+
+        print(
+            f"  SCAN COMPLETE: {len(rd_arbs)} intra-Rundown arbs + "
+            f"{len(cross_arbs)} cross-source arbs → "
+            f"{len(state.arbs)} total (deduped) | "
+            f"Kalshi:{len(kalshi_events)} Poly:{len(poly_events)} "
+            f"Bovada:{len(bovada_events)} events"
+        )
+
+        return web.json_response(
             {
-                "ok": True,
-                "sports": selected_names,
-                "lastScanMs": state.last_scan_ms,
-                "count": len(state.arbs),
-                "arbs": state.arbs,
-                "lines": state.lines,
-                "bestLines": state.best_lines,
-                "matchedGames": matched_games,
-                "bovadaError": bovada_error,
-                "dataAge": None if _STORE.freshest_update_age() == float("inf") else int(_STORE.freshest_update_age()),
-                "dpRemaining": _STORE.dp_remaining,
+                "ok":           True,
+                "sports":       selected_names,
+                "lastScanMs":   state.last_scan_ms,
+                "count":        len(state.arbs),
+                "arbs":         state.arbs,
+                "lines":        state.lines,
+                "bestLines":    state.best_lines,
+                "matchedGames": len(game_pool),
+                "sourceCounts": {
+                    "therundown": len(rundown_events),
+                    "bovada":     len(bovada_events),
+                    "kalshi":     len(kalshi_events),
+                    "polymarket": len(poly_events),
+                },
+                "bovadaError":  bovada_error,
+                "pmError":      pm_error,
+                "dataAge":      None if _STORE.freshest_update_age() == float("inf")
+                                else int(_STORE.freshest_update_age()),
+                "dpRemaining":  _STORE.dp_remaining,
             },
             dumps=lambda x: json.dumps(x, default=_serialize),
         )
+
     except Exception as e:
         state.last_error = str(e)
-        resp = web.json_response({"ok": False, "error": state.last_error}, status=500)
-
-    return resp
+        logger.exception("handle_scan_now error")
+        return web.json_response({"ok": False, "error": state.last_error}, status=500)
 
 
 async def scan_loop(app: web.Application):

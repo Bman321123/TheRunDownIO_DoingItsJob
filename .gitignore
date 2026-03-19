@@ -5,11 +5,17 @@ frontend/node_modules/
 node_modules/
 frontend/.next/
 frontend/out/
+frontend/.git/
+frontend/tsconfig.tsbuildinfo
 
 # GSD
 .planning/
 .gemini/
 .gsd-local-patches/
+
+# Secrets
+.env
+*.pem
 
 # Diagnostic / Temp files
 diagnostic_*.md

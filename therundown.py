@@ -348,8 +348,16 @@ class RundownClient:
         """
         Discover available markets for all sports on a date.
         Response is keyed by sport_id strings.
+        NOTE: Prefer get_sport_markets() for per-sport discovery.
         """
         return self._get(f"/sports/markets/{date_str}", params={"offset": str(offset)})
+
+    def get_sport_markets(self, sport_id: int, date_str: str, offset: str = "300") -> dict:
+        """
+        Discover active markets for a specific sport/date.
+        Uses V2 endpoint: /sports/{sport_id}/markets/{date}.
+        """
+        return self._get(f"/sports/{sport_id}/markets/{date_str}", params={"offset": offset})
 
     def get_prop_events(self, sport_id, date_str):
         """
@@ -841,9 +849,14 @@ def parse_player_props(event: dict, sport_name: str) -> tuple[list[dict], list[d
         if not isinstance(m, dict):
             continue
 
-        market_id = m.get("market_id")
+        # Normalise market_id to int — V2 API can return string or int
+        try:
+            market_id = int(m.get("market_id"))
+        except (TypeError, ValueError):
+            continue
         if market_id not in PROP_MARKET_IDS:
             continue
+
         event_diag["prop_markets_seen"] += 1
         prop_type = PROP_MARKET_NAMES[market_id]
 
@@ -859,29 +872,8 @@ def parse_player_props(event: dict, sport_name: str) -> tuple[list[dict], list[d
                     )
                     print(f"    prices keys (book ids): {list((ln.get('prices') or {}).keys())[:5]}")
 
-        # Map numeric line thresholds to known player names from TYPE_PLAYER branch.
-        players_by_threshold: dict[float, set[str]] = {}
-        for participant in m.get("participants") or []:
-            if not isinstance(participant, dict):
-                continue
-            if participant.get("type") != "TYPE_PLAYER":
-                continue
-            participant_name = str(participant.get("name") or "").strip()
-            if not participant_name:
-                continue
-            for line in participant.get("lines") or []:
-                if not isinstance(line, dict):
-                    continue
-                if line.get("line_value_is_participant"):
-                    continue
-                val = line.get("value")
-                if val is None:
-                    val = line.get("point")
-                try:
-                    threshold = float(val)
-                except (TypeError, ValueError):
-                    continue
-                players_by_threshold.setdefault(threshold, set()).add(participant_name)
+        # V2 player props expose TYPE_OVER/TYPE_UNDER participants with names
+        # like "LeBron James Over". Resolve player names inline below.
 
         prop_buckets: dict[tuple[str, float | None], dict[str, list[dict]]] = {}
         market_lines_accepted = 0
@@ -905,9 +897,6 @@ def parse_player_props(event: dict, sport_name: str) -> tuple[list[dict], list[d
                     side = "over"
                 elif "under" in p_name_l:
                     side = "under"
-            elif p_type_u == "TYPE_PLAYER":
-                # TYPE_PLAYER participants are used for player/threshold mapping only.
-                continue
             else:
                 event_diag["unknown_participant_type"] += 1
                 continue
@@ -920,13 +909,11 @@ def parse_player_props(event: dict, sport_name: str) -> tuple[list[dict], list[d
                     continue
                 event_diag["lines_considered"] += 1
 
-                player_name: str | None = None
-                line_threshold: float | None = None
                 if line.get("line_value_is_participant"):
-                    line_player = str(line.get("value") or "").strip()
-                    if line_player:
-                        player_name = line_player
+                    player_name = str(line.get("value") or "").strip()
+                    line_threshold: float | None = None
                 else:
+                    player_name = _normalize_player_name_from_side_participant(p_name)
                     val = line.get("value")
                     if val is None:
                         val = line.get("point")
@@ -934,19 +921,6 @@ def parse_player_props(event: dict, sport_name: str) -> tuple[list[dict], list[d
                         line_threshold = float(val)
                     except (TypeError, ValueError):
                         line_threshold = None
-                    # Side-typed participant names frequently contain player names.
-                    if p_type_u in {"TYPE_OVER", "TYPE_UNDER"}:
-                        candidate_name = _normalize_player_name_from_side_participant(p_name)
-                        if candidate_name:
-                            player_name = candidate_name
-                    elif line_threshold is not None:
-                        candidates = players_by_threshold.get(line_threshold) or set()
-                        if len(candidates) == 1:
-                            player_name = next(iter(candidates))
-                        elif len(candidates) > 1 and p_name:
-                            normalized = _normalize_player_name_from_side_participant(p_name)
-                            if normalized in candidates:
-                                player_name = normalized
 
                 if not player_name:
                     event_diag["missing_player"] += 1
@@ -1029,7 +1003,7 @@ def parse_player_props(event: dict, sport_name: str) -> tuple[list[dict], list[d
                     event_diag["lines_accepted"] += 1
                     market_lines_accepted += 1
 
-        warn_key = (sport_name, int(market_id))
+        warn_key = (sport_name, market_id)
         if market_lines_accepted == 0 and warn_key not in _PROP_ZERO_YIELD_LOGGED:
             participants = m.get("participants") or []
             if participants:

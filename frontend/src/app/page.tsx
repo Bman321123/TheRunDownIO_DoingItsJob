@@ -3,12 +3,18 @@
 import { useEffect, useMemo, useState } from "react";
 import type { Arb, RawLine, BestLine, ScanNowResponse } from "@/lib/types";
 import { ArbCard } from "@/components/ArbCard";
+import { Button } from "@/components/ui/button";
+import { Card } from "@/components/ui/card";
+import { UnderlineTabs } from "@/components/ui/underline-tabs";
+import { AnimatedTextReveal } from "@/components/ui/animated-text-reveal";
+import { Badge } from "@/components/ui/badge";
 
 const DEFAULT_BASE = "http://127.0.0.1:3030";
 
 const SPORTS = ["NCAAF", "NFL", "MLB", "NBA", "NCAAB", "NHL", "NCAAWB", "MMA"] as const;
 type Sport = (typeof SPORTS)[number];
 
+const SCAN_LABELS = ["Scanning lines…", "Fetching odds…", "Matching games…", "Calculating arbs…"] as const;
 export default function HomePage() {
   const baseUrl = process.env.NEXT_PUBLIC_ARBS_URL || DEFAULT_BASE;
   const arbsUrl = `${baseUrl.replace(/\/$/, "")}/arbs`;
@@ -24,8 +30,11 @@ export default function HomePage() {
   const [lastScannedMs, setLastScannedMs] = useState<number | null>(null);
   const [dataAge, setDataAge] = useState<number | null>(null);
   const [dpRemaining, setDpRemaining] = useState<string | null>(null);
+  // Intentionally no "arb entrance" stagger animation (handled by PRD UI fixes).
 
   const [activeTab, setActiveTab] = useState<"arbs" | "lines" | "best">("arbs");
+  const [displayTab, setDisplayTab] = useState<"arbs" | "lines" | "best">(activeTab);
+  const [tabKey, setTabKey] = useState(0);
   const [expandedBooks, setExpandedBooks] = useState<Set<string>>(new Set());
   const [openDrawers, setOpenDrawers] = useState<Set<string>>(new Set());
 
@@ -71,6 +80,18 @@ export default function HomePage() {
     };
   }, [arbsUrl]);
 
+  useEffect(() => {
+    if (activeTab === displayTab) return;
+
+    // Tiny delay so the fade-out of old content isn't jarring.
+    const timer = window.setTimeout(() => {
+      setDisplayTab(activeTab);
+      setTabKey((k) => k + 1);
+    }, 80);
+
+    return () => window.clearTimeout(timer);
+  }, [activeTab, displayTab]);
+
   async function scanNow() {
     const sports = Array.from(selectedSports);
     if (sports.length === 0) return;
@@ -101,22 +122,25 @@ export default function HomePage() {
 
   return (
     <main className="space-y-5">
-      <header className="flex flex-col gap-3 rounded-2xl border border-zinc-800 bg-zinc-900/30 px-5 py-4">
+      <header className="flex flex-col gap-4 rounded-xl border border-subtle bg-raised px-6 py-5 shadow-card transition-all duration-200 hover:shadow-card-hover hover:border-emphasis">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
-            <div className="text-sm font-semibold text-zinc-100">Arbitrage Dashboard</div>
-            <div className="mt-0.5 text-xs text-zinc-400">
-              Source: <span className="font-mono text-zinc-300">{baseUrl}</span>
+            <div className="text-2xl font-semibold tracking-tight text-primary">
+              <AnimatedTextReveal text="Arbitrage Dashboard" />
+            </div>
+            <div className="mt-1 text-sm text-secondary">
+              Scan and compare book lines to surface both-sides value.{" "}
+              <span className="font-mono tracking-tight text-muted-text">{baseUrl}</span>
             </div>
           </div>
 
           <div className="flex items-center gap-4">
             {dataAge !== null && (
               <div className="text-right">
-                <div className="text-xs text-zinc-400">Data Age</div>
+                <div className="text-xs text-[#9898B8]">Data Age</div>
                 <div className={[
                   "text-sm font-semibold",
-                  dataAge > 300 ? "text-red-400" : dataAge > 120 ? "text-amber-300" : "text-emerald-300",
+                  dataAge > 300 ? "text-red-700" : dataAge > 120 ? "text-amber-700" : "text-emerald-700",
                 ].join(" ")}>
                   {dataAge < 60 ? `${dataAge}s` : `${Math.floor(dataAge / 60)}m ${dataAge % 60}s`}
                 </div>
@@ -124,20 +148,20 @@ export default function HomePage() {
             )}
             {dpRemaining && (
               <div className="text-right">
-                <div className="text-xs text-zinc-400">DP Left</div>
-                <div className="text-sm font-semibold text-zinc-200">{dpRemaining}</div>
+                <div className="text-xs text-[#9898B8]">DP Left</div>
+                <div className="text-sm font-semibold text-[#E8E8F8]">{dpRemaining}</div>
               </div>
             )}
             <div className="text-right">
-              <div className="text-xs text-zinc-400">Status</div>
-              <div className="text-sm font-semibold text-zinc-100">{header}</div>
+              <div className="text-xs text-[#9898B8]">Status</div>
+              <div className="text-sm font-semibold text-[#E8E8F8]">{header}</div>
             </div>
           </div>
         </div>
 
         {dataAge !== null && dataAge > 300 && (
-          <div className="rounded-lg bg-red-500/10 border border-red-500/30 px-3 py-2 text-xs text-red-300">
-            ⚠ Data is {Math.floor(dataAge / 60)}+ minutes old. Odds may have changed. Click &quot;Scan Lines&quot; to refresh.
+          <div className="rounded-lg bg-amber-500/10 border border-amber-500/25 px-3 py-2 text-xs text-amber-200">
+            Data is {Math.floor(dataAge / 60)}+ minutes old. Odds may have changed. Click &quot;Scan Lines&quot; to refresh.
           </div>
         )}
 
@@ -157,10 +181,10 @@ export default function HomePage() {
                   });
                 }}
                 className={[
-                  "rounded-full px-3 py-1 text-xs font-semibold transition",
+                  "rounded-pill px-3 py-1 text-xs font-semibold transition-colors duration-150 ring-1",
                   active
-                    ? "bg-emerald-500/15 text-emerald-200 ring-1 ring-emerald-500/40"
-                    : "bg-zinc-800/60 text-zinc-300 ring-1 ring-zinc-700",
+                    ? "bg-emerald-500/20 text-emerald-300 ring-emerald-400/50"
+                    : "bg-white/[0.05] text-[#9898B8] ring-white/[0.10] hover:text-[#D4D4E8] hover:bg-white/[0.08]",
                 ].join(" ")}
               >
                 {s}
@@ -168,89 +192,69 @@ export default function HomePage() {
             );
           })}
           <div className="flex-1" />
-          <button
+          <Button
             type="button"
-            disabled={selectedSports.size === 0 || scanStatus === "scanning"}
+            variant="scan"
+            loading={scanStatus === "scanning"}
+            disabled={selectedSports.size === 0}
+            scanLabels={Array.from(SCAN_LABELS)}
             onClick={scanNow}
-            className={[
-              "inline-flex items-center gap-2 rounded-xl px-4 py-2 text-sm font-semibold",
-              "bg-emerald-500 text-zinc-950 hover:bg-emerald-400 disabled:cursor-not-allowed disabled:opacity-60",
-            ].join(" ")}
           >
-            {scanStatus === "scanning" ? (
-              <span className="inline-block h-4 w-4 animate-spin rounded-full border-2 border-zinc-900/40 border-t-zinc-950" />
-            ) : null}
             Scan Lines
-          </button>
+          </Button>
         </div>
 
         <div className="flex flex-wrap items-center justify-between gap-3">
-          <div className="text-xs text-zinc-400">
-            Opportunities: <span className="font-semibold text-zinc-200">{count}</span>
+          <div className="text-xs text-[#9898B8]">
+            Opportunities: <span className="font-semibold text-[#E8E8F8]">{count}</span>
           </div>
-          <div className="text-xs text-zinc-400">
+          <div className="text-xs text-[#9898B8]">
             Last scanned:{" "}
-            <span className="font-semibold text-zinc-200">
+            <span className="font-semibold text-[#E8E8F8]">
               {lastScannedMs ? new Date(lastScannedMs).toLocaleTimeString() : "—"}
             </span>
           </div>
         </div>
 
         {status === "error" || scanStatus === "error" ? (
-          <div className="text-xs text-rose-300">
+          <div className="text-xs text-[#FCA5A5]">
             Error: {error}. Make sure `/Users/seniortech/therundownioV1/server.py` is running on port 3030.
           </div>
         ) : null}
 
-        <div className="flex gap-4 border-b border-zinc-800 pt-2">
-          <button
-            onClick={() => setActiveTab("arbs")}
-            className={`pb-2 text-sm font-semibold transition border-b-2 ${
-              activeTab === "arbs" ? "border-emerald-500 text-emerald-400" : "border-transparent text-zinc-400 hover:text-zinc-200"
-            }`}
-          >
-            Arbitrage Opportunities
-          </button>
-          <button
-            onClick={() => setActiveTab("lines")}
-            className={`pb-2 text-sm font-semibold transition border-b-2 ${
-              activeTab === "lines" ? "border-emerald-500 text-emerald-400" : "border-transparent text-zinc-400 hover:text-zinc-200"
-            }`}
-          >
-            Raw Book Lines
-          </button>
-          <button
-            onClick={() => setActiveTab("best")}
-            className={`pb-2 text-sm font-semibold transition border-b-2 ${
-              activeTab === "best"
-                ? "border-emerald-500 text-emerald-400"
-                : "border-transparent text-zinc-400 hover:text-zinc-200"
-            }`}
-          >
-            Best Lines (Odds Shopping)
-          </button>
-        </div>
+        <UnderlineTabs
+          className="pt-2"
+          value={activeTab}
+          onValueChange={setActiveTab}
+          tabs={[
+            { value: "arbs", label: "Arbitrage Opportunities" },
+            { value: "lines", label: "Raw Book Lines" },
+            { value: "best", label: "Best Lines (Odds Shopping)" },
+          ]}
+        />
       </header>
 
-      {activeTab === "arbs" && (
-        <section className="grid grid-cols-1 gap-5">
-          {arbs.map((arb, idx) => (
-            <ArbCard key={`${arb.game}-${arb.market_kind}-${arb.line_label ?? ""}-${idx}`} arb={arb} />
-          ))}
-        </section>
-      )}
+      <div>
+        <div key={tabKey} className="tab-fade-in">
+        {displayTab === "arbs" && (
+          <section className="grid grid-cols-1 gap-5">
+            {arbs.map((arb, idx) => (
+              <ArbCard key={`${arb.game}-${arb.market_kind}-${arb.line_label ?? ""}-${idx}`} arb={arb} />
+            ))}
+          </section>
+        )}
 
-      {activeTab === "lines" && (
-        <section className="space-y-4">
+        {displayTab === "lines" && (
+          <section className="space-y-4">
           {Array.from(new Set(lines.map((l) => l.book)))
             .sort()
             .map((bookName) => {
               const isExpanded = expandedBooks.has(bookName);
               const bookLines = lines.filter((l) => l.book === bookName);
               return (
-                <div
+                <Card
                   key={bookName}
-                  className="rounded-2xl border border-zinc-800 bg-zinc-900/40 shadow-card overflow-hidden"
+                  className="overflow-hidden rounded-xl border border-subtle bg-surface shadow-card hover:shadow-card-hover hover:border-emphasis transition-all duration-200"
                 >
                   <button
                     onClick={() =>
@@ -261,21 +265,21 @@ export default function HomePage() {
                         return next;
                       })
                     }
-                    className="w-full flex items-center justify-between px-5 py-4 bg-zinc-800/20 hover:bg-zinc-800/40 transition"
+                    className="w-full flex items-center justify-between px-5 py-4 bg-surface hover:bg-overlay/40 transition"
                   >
-                    <div className="font-semibold text-zinc-100 flex items-center gap-3">
+                    <div className="flex items-center gap-3 text-primary font-semibold">
                       <span className="text-lg">{bookName}</span>
-                      <span className="text-xs font-mono text-zinc-400 bg-zinc-900 px-2 py-0.5 rounded-full">
+                      <span className="text-xs font-mono tracking-tight text-muted-text bg-overlay/40 px-2 py-0.5 rounded-pill border border-border">
                         {bookLines.length} lines pulled
                       </span>
                     </div>
-                    <div className="text-zinc-400">{isExpanded ? "▲ Hide" : "▼ Show"}</div>
+                    <div className="text-secondary">{isExpanded ? "▲ Hide" : "▼ Show"}</div>
                   </button>
                   {isExpanded && (
-                    <div className="p-5 border-t border-zinc-800">
-                      <table className="w-full text-left text-sm text-zinc-300">
+                    <div className="p-5 border-t border-border drawer-open">
+                      <table className="w-full text-left text-sm text-[#D4D4E8]">
                         <thead>
-                          <tr className="border-b border-zinc-800 text-zinc-400">
+                          <tr className="border-b border-subtle text-[#9898B8]">
                             <th className="font-medium pb-2">Time</th>
                             <th className="font-medium pb-2">Sport</th>
                             <th className="font-medium pb-2">Game</th>
@@ -284,23 +288,23 @@ export default function HomePage() {
                             <th className="font-medium text-right pb-2">American Odds</th>
                           </tr>
                         </thead>
-                        <tbody className="divide-y divide-zinc-800/50">
+                        <tbody className="divide-y divide-border/70">
                           {bookLines.map((l, i) => (
-                            <tr key={i} className="hover:bg-zinc-800/30 transition group">
-                              <td className="py-2.5 px-2 text-xs font-mono text-zinc-500 whitespace-nowrap">
+                            <tr key={i} className="hover:bg-overlay/40 transition group">
+                              <td className="py-2.5 px-2 text-xs font-mono tracking-tight text-[#D4D4E8] whitespace-nowrap">
                                 {l.updated_at ? new Date(l.updated_at).toLocaleTimeString() : "N/A"}
                               </td>
-                              <td className="py-2.5 px-2 font-semibold text-zinc-200">{l.sport}</td>
-                              <td className="py-2.5 px-2 text-zinc-200">{l.game}</td>
+                              <td className="py-2.5 px-2 font-semibold text-[#D4D4E8]">{l.sport}</td>
+                              <td className="py-2.5 px-2 text-[#D4D4E8]">{l.game}</td>
                               <td className="py-2.5 px-2">
-                                <span className="inline-flex bg-zinc-800 rounded px-1.5 py-0.5 text-xs text-zinc-300 capitalize mix-blend-screen">
+                                <span className="inline-flex bg-surface rounded px-1.5 py-0.5 text-xs text-[#D4D4E8] capitalize border border-border">
                                   {l.market_kind} {l.line_label}
                                 </span>
                               </td>
                               <td className="py-2.5 px-2 font-medium">{l.side}</td>
                               <td
-                                className={`py-2.5 px-2 text-right font-bold ${
-                                  l.odds_am > 0 ? "text-emerald-400" : "text-amber-300"
+                                className={`py-2.5 px-2 text-right font-bold tabular-nums ${
+                                  l.odds_am > 0 ? "text-[#34D399]" : "text-[#F87171]"
                                 }`}
                               >
                                 {l.odds_am > 0 ? `+${l.odds_am}` : l.odds_am}
@@ -311,18 +315,18 @@ export default function HomePage() {
                       </table>
                     </div>
                   )}
-                </div>
+                </Card>
               );
             })}
         </section>
       )}
 
-      {activeTab === "best" && (
+      {displayTab === "best" && (
         <section className="space-y-4">
           {bestLines.length === 0 ? (
-            <div className="rounded-2xl border border-zinc-800 bg-zinc-900/40 px-5 py-4 text-sm text-zinc-300">
+            <Card className="rounded-lg border border-subtle bg-surface px-5 py-4 text-sm text-secondary shadow-card">
               No eligible markets found for the current scan. Try scanning again or adjusting sports selection.
-            </div>
+            </Card>
           ) : (
             Array.from(
               bestLines.reduce((acc, bl) => {
@@ -332,7 +336,69 @@ export default function HomePage() {
                 acc.set(key, list);
                 return acc;
               }, new Map<string, BestLine[]>())
-            ).map(([key, linesForEvent]) => {
+            )
+              .map(([key, linesForEvent]) => {
+                // Order events by best (highest) both-sides ROI% across all markets.
+                const amToDec = (am: number) =>
+                  am >= 100 ? am / 100 + 1 : am <= -100 ? 100 / Math.abs(am) + 1 : 0;
+                const pairValue = (oddsA: number, oddsB: number) => {
+                  const decA = amToDec(oddsA);
+                  const decB = amToDec(oddsB);
+                  if (decA <= 1 || decB <= 1) return null;
+                  return Math.round((1 - (1 / decA + 1 / decB)) * 10000) / 100;
+                };
+
+                const ml = linesForEvent.filter((l) => l.type === "moneyline");
+                const spreads = linesForEvent.filter((l) => l.type === "spread");
+                const totals = linesForEvent.filter((l) => l.type === "total");
+                const props = linesForEvent.filter((l) => l.type === "prop");
+
+                let best = -Infinity;
+
+                for (const bl of ml) {
+                  if (!bl.home?.odds_am || !bl.away?.odds_am) continue;
+                  const v = pairValue(bl.home.odds_am, bl.away.odds_am);
+                  if (v != null) best = Math.max(best, v);
+                }
+                for (const bl of totals) {
+                  if (!bl.over?.odds_am || !bl.under?.odds_am) continue;
+                  const v = pairValue(bl.over.odds_am, bl.under.odds_am);
+                  if (v != null) best = Math.max(best, v);
+                }
+                for (const bl of props) {
+                  if (!bl.over?.odds_am || !bl.under?.odds_am) continue;
+                  const v = pairValue(bl.over.odds_am, bl.under.odds_am);
+                  if (v != null) best = Math.max(best, v);
+                }
+
+                // For spreads, compute best ROI across paired home/away lines by abs(line).
+                const byAbs = new Map<number, BestLine[]>();
+                for (const s of spreads) {
+                  if (s.line == null || !s.pick?.odds_am || !s.side) continue;
+                  const abs = Math.abs(s.line);
+                  const list = byAbs.get(abs) ?? [];
+                  list.push(s);
+                  byAbs.set(abs, list);
+                }
+                for (const [, entries] of byAbs.entries()) {
+                  const homeNeg = entries.find((e) => e.side === "home" && (e.line ?? 0) < 0);
+                  const awayPos = entries.find((e) => e.side === "away" && (e.line ?? 0) > 0);
+                  const homePos = entries.find((e) => e.side === "home" && (e.line ?? 0) > 0);
+                  const awayNeg = entries.find((e) => e.side === "away" && (e.line ?? 0) < 0);
+                  if (homeNeg?.pick?.odds_am != null && awayPos?.pick?.odds_am != null) {
+                    const v = pairValue(homeNeg.pick.odds_am, awayPos.pick.odds_am);
+                    if (v != null) best = Math.max(best, v);
+                  }
+                  if (homePos?.pick?.odds_am != null && awayNeg?.pick?.odds_am != null) {
+                    const v = pairValue(homePos.pick.odds_am, awayNeg.pick.odds_am);
+                    if (v != null) best = Math.max(best, v);
+                  }
+                }
+
+                return { key, linesForEvent, score: Number.isFinite(best) ? best : -999 };
+              })
+              .sort((a, b) => (b.score - a.score) || a.key.localeCompare(b.key))
+              .map(({ key, linesForEvent }) => {
               const [sport, game] = key.split("::");
               const ml = linesForEvent.filter((l) => l.type === "moneyline");
               const spreads = linesForEvent.filter((l) => l.type === "spread");
@@ -352,6 +418,8 @@ export default function HomePage() {
                 if (lower.includes("draftk")) return "DK";
                 if (lower.includes("betmgm") || lower.includes("mgm")) return "BMG";
                 if (lower.includes("kalshi")) return "Kalshi";
+                if (lower.includes("polymarket")) return "PM";
+                if (lower.includes("bovada")) return "Bovada";
                 if (lower.includes("hard rock") || lower.includes("hardrock")) return "HRB";
                 return name;
               };
@@ -360,7 +428,11 @@ export default function HomePage() {
                 return v > 0 ? `+${v}` : `${v}`;
               };
               const oddsColor = (v: number | undefined | null) =>
-                v == null ? "text-zinc-500" : v > 0 ? "text-emerald-400" : "text-red-400";
+                v == null
+                  ? "text-secondary tabular-nums"
+                  : v > 0
+                    ? "font-bold tabular-nums text-[#34D399]"
+                    : "font-bold tabular-nums text-[#F87171]";
               const amToDec = (am: number) =>
                 am >= 100 ? am / 100 + 1 : am <= -100 ? 100 / Math.abs(am) + 1 : 0;
               const pairValue = (oddsA: number, oddsB: number) => {
@@ -373,11 +445,13 @@ export default function HomePage() {
                 if (val == null) return null;
                 const positive = val >= 0;
                 return (
-                  <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-bold font-mono ${
-                    positive ? "bg-emerald-500/15 text-emerald-300" : "bg-red-500/15 text-red-300"
-                  }`}>
-                    {positive ? "+" : ""}{val.toFixed(1)}%
-                  </span>
+                  <Badge
+                    variant={positive ? "success" : "danger"}
+                    className="font-mono text-[11px] font-bold"
+                  >
+                    {positive ? "+" : ""}
+                    {val.toFixed(1)}%
+                  </Badge>
                 );
               };
 
@@ -393,19 +467,33 @@ export default function HomePage() {
                   list.push(s);
                   byAbs.set(abs, list);
                 }
-                return Array.from(byAbs.entries()).sort(([a], [b]) => a - b);
+                // Highest ROI% first (fallback: smaller abs line first).
+                return Array.from(byAbs.entries()).sort(([absA, entriesA], [absB, entriesB]) => {
+                  const bestFor = (entries: BestLine[]) => {
+                    const homeNeg = entries.find((e) => e.side === "home" && (e.line ?? 0) < 0);
+                    const awayPos = entries.find((e) => e.side === "away" && (e.line ?? 0) > 0);
+                    const homePos = entries.find((e) => e.side === "home" && (e.line ?? 0) > 0);
+                    const awayNeg = entries.find((e) => e.side === "away" && (e.line ?? 0) < 0);
+                    const vA = homeNeg && awayPos ? pairValue(homeNeg.pick!.odds_am, awayPos.pick!.odds_am) : null;
+                    const vB = homePos && awayNeg ? pairValue(homePos.pick!.odds_am, awayNeg.pick!.odds_am) : null;
+                    return Math.max(vA ?? -999, vB ?? -999);
+                  };
+                  const diff = bestFor(entriesB) - bestFor(entriesA);
+                  if (diff !== 0) return diff;
+                  return absA - absB;
+                });
               })();
 
               return (
-                <div
+                <Card
                   key={key}
-                  className="rounded-2xl border border-zinc-800 bg-zinc-900/40 shadow-card overflow-hidden"
+                  className="overflow-hidden rounded-xl border border-subtle bg-surface shadow-card"
                 >
                   <div className="px-5 py-4">
                     <div className="flex items-center justify-between gap-3">
                       <div>
-                        <div className="text-xs uppercase tracking-wide text-zinc-500">{sport}</div>
-                        <div className="text-base font-semibold text-zinc-100">{game}</div>
+                        <div className="text-xs uppercase tracking-wide text-secondary">{sport}</div>
+                        <div className="text-base font-semibold text-primary">{game}</div>
                       </div>
                     </div>
 
@@ -416,37 +504,37 @@ export default function HomePage() {
                       return (
                         <div key={`ml-${idx}`} className="mt-3">
                           <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
-                            <div className="flex items-center justify-between rounded-xl bg-zinc-800/50 px-4 py-3">
+                            <div className="flex items-center justify-between rounded-xl bg-overlay px-4 py-3">
                               <div>
-                                <div className="text-[10px] uppercase tracking-wider text-zinc-500">Home</div>
-                                <div className="text-sm font-bold text-zinc-100">{bl.home_team}</div>
+                                <div className="text-[10px] uppercase tracking-wider text-secondary">Home</div>
+                                <div className="text-sm font-bold text-primary">{bl.home_team}</div>
                               </div>
                               <div className="flex items-center gap-2">
                                 <span className={`font-mono text-lg font-bold ${oddsColor(bl.home.odds_am)}`}>
                                   {formatOdds(bl.home.odds_am)}
                                 </span>
-                                <span className="rounded-full bg-zinc-700 px-2 py-0.5 text-xs font-semibold text-zinc-200">
+                                <span className="rounded-full bg-muted px-2 py-0.5 text-xs font-semibold text-primary">
                                   {shortBook(bl.home.book)}
                                 </span>
                               </div>
                             </div>
-                            <div className="flex items-center justify-between rounded-xl bg-zinc-800/50 px-4 py-3">
+                            <div className="flex items-center justify-between rounded-xl bg-overlay px-4 py-3">
                               <div>
-                                <div className="text-[10px] uppercase tracking-wider text-zinc-500">Away</div>
-                                <div className="text-sm font-bold text-zinc-100">{bl.away_team}</div>
+                                <div className="text-[10px] uppercase tracking-wider text-secondary">Away</div>
+                                <div className="text-sm font-bold text-primary">{bl.away_team}</div>
                               </div>
                               <div className="flex items-center gap-2">
                                 <span className={`font-mono text-lg font-bold ${oddsColor(bl.away.odds_am)}`}>
                                   {formatOdds(bl.away.odds_am)}
                                 </span>
-                                <span className="rounded-full bg-zinc-700 px-2 py-0.5 text-xs font-semibold text-zinc-200">
+                                <span className="rounded-full bg-muted px-2 py-0.5 text-xs font-semibold text-primary">
                                   {shortBook(bl.away.book)}
                                 </span>
                               </div>
                             </div>
                           </div>
                           {mlVal != null && (
-                            <div className="mt-1.5 flex items-center gap-2 text-[10px] text-zinc-500">
+                            <div className="mt-1.5 flex items-center gap-2 text-[10px] text-muted-text">
                               <span>Both-sides value:</span> {valueBadge(mlVal)}
                             </div>
                           )}
@@ -456,7 +544,7 @@ export default function HomePage() {
                   </div>
 
                   {(spreads.length > 0 || totals.length > 0 || props.length > 0) && (
-                    <div className="flex border-t border-zinc-800">
+                    <div className="flex border-t border-border">
                       {spreads.length > 0 && (
                         <button
                           type="button"
@@ -464,8 +552,8 @@ export default function HomePage() {
                           className={[
                             "flex-1 flex items-center justify-center gap-2 px-4 py-2.5 text-xs font-semibold transition",
                             spreadsOpen
-                              ? "bg-zinc-800/60 text-emerald-300"
-                              : "bg-zinc-900/20 text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/30",
+                              ? "bg-overlay text-accent-green"
+                              : "bg-surface text-secondary hover:text-primary hover:bg-overlay",
                           ].join(" ")}
                         >
                           <span>{spreadsOpen ? "▾" : "▸"}</span>
@@ -479,10 +567,10 @@ export default function HomePage() {
                           onClick={() => toggleDrawer(totalKey)}
                           className={[
                             "flex-1 flex items-center justify-center gap-2 px-4 py-2.5 text-xs font-semibold transition",
-                            spreads.length > 0 ? "border-l border-zinc-800" : "",
+                            spreads.length > 0 ? "border-l border-border" : "",
                             totalsOpen
-                              ? "bg-zinc-800/60 text-emerald-300"
-                              : "bg-zinc-900/20 text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/30",
+                              ? "bg-overlay text-accent-green"
+                              : "bg-surface text-secondary hover:text-primary hover:bg-overlay",
                           ].join(" ")}
                         >
                           <span>{totalsOpen ? "▾" : "▸"}</span>
@@ -496,10 +584,10 @@ export default function HomePage() {
                           onClick={() => toggleDrawer(propKey)}
                           className={[
                             "flex-1 flex items-center justify-center gap-2 px-4 py-2.5 text-xs font-semibold transition",
-                            spreads.length > 0 || totals.length > 0 ? "border-l border-zinc-800" : "",
+                            spreads.length > 0 || totals.length > 0 ? "border-l border-border" : "",
                             propsOpen
-                              ? "bg-zinc-800/60 text-emerald-300"
-                              : "bg-zinc-900/20 text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/30",
+                              ? "bg-overlay text-accent-green"
+                              : "bg-surface text-secondary hover:text-primary hover:bg-overlay",
                           ].join(" ")}
                         >
                           <span>{propsOpen ? "▾" : "▸"}</span>
@@ -511,7 +599,7 @@ export default function HomePage() {
                   )}
 
                   {spreadsOpen && spreadPairs.length > 0 && (
-                    <div className="border-t border-zinc-800 px-5 py-3 space-y-3">
+                    <div className="border-t border-border px-5 py-3 space-y-3">
                       {spreadPairs.map(([absLine, entries]) => {
                         const homeNeg = entries.find((e) => e.side === "home" && (e.line ?? 0) < 0);
                         const awayPos = entries.find((e) => e.side === "away" && (e.line ?? 0) > 0);
@@ -526,44 +614,48 @@ export default function HomePage() {
 
                         return (
                           <div key={`sp-${absLine}`} className="space-y-1.5">
-                            <div className="text-[10px] uppercase tracking-wider text-zinc-500 font-semibold">
+                              <div className="text-[10px] uppercase tracking-wider text-secondary font-semibold">
                               Spread {absLine}
                             </div>
 
                             {pairA && (
                               <div>
                                 <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-2">
-                                  <div className="flex items-center justify-between rounded-lg bg-zinc-800/40 px-3 py-1.5">
-                                    <span className="text-xs text-zinc-300">
+                                  <div className="flex items-center justify-between rounded-lg bg-overlay px-3 py-1.5">
+                                    <span className="text-xs text-primary">
                                       {homeName}{" "}
-                                      <span className={`font-mono ${oddsColor(homeNeg!.line)}`}>{formatOdds(homeNeg!.line)}</span>
+                                      <span className={`font-mono ${oddsColor(homeNeg!.line)}`}>
+                                        {formatOdds(homeNeg!.line)}
+                                      </span>
                                     </span>
                                     <div className="flex items-center gap-1.5">
                                       <span className={`font-mono text-sm font-semibold ${oddsColor(homeNeg!.pick!.odds_am)}`}>
                                         {formatOdds(homeNeg!.pick!.odds_am)}
                                       </span>
-                                      <span className="rounded-full bg-zinc-700 px-1.5 py-0.5 text-[10px] font-semibold text-zinc-200">
+                                      <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-semibold text-primary">
                                         {shortBook(homeNeg!.pick!.book)}
                                       </span>
                                     </div>
                                   </div>
-                                  <div className="flex items-center justify-between rounded-lg bg-zinc-800/40 px-3 py-1.5">
-                                    <span className="text-xs text-zinc-300">
+                                  <div className="flex items-center justify-between rounded-lg bg-overlay px-3 py-1.5">
+                                    <span className="text-xs text-primary">
                                       {awayName}{" "}
-                                      <span className={`font-mono ${oddsColor(awayPos!.line)}`}>{formatOdds(awayPos!.line)}</span>
+                                      <span className={`font-mono ${oddsColor(awayPos!.line)}`}>
+                                        {formatOdds(awayPos!.line)}
+                                      </span>
                                     </span>
                                     <div className="flex items-center gap-1.5">
                                       <span className={`font-mono text-sm font-semibold ${oddsColor(awayPos!.pick!.odds_am)}`}>
                                         {formatOdds(awayPos!.pick!.odds_am)}
                                       </span>
-                                      <span className="rounded-full bg-zinc-700 px-1.5 py-0.5 text-[10px] font-semibold text-zinc-200">
+                                      <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-semibold text-primary">
                                         {shortBook(awayPos!.pick!.book)}
                                       </span>
                                     </div>
                                   </div>
                                 </div>
                                 {valA != null && (
-                                  <div className="mt-1 flex items-center gap-1.5 pl-1 text-[10px] text-zinc-500">
+                                  <div className="mt-1 flex items-center gap-1.5 pl-1 text-[10px] text-muted-text">
                                     Value: {valueBadge(valA)}
                                   </div>
                                 )}
@@ -573,46 +665,48 @@ export default function HomePage() {
                             {pairB && (
                               <div>
                                 <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-2">
-                                  <div className="flex items-center justify-between rounded-lg bg-zinc-800/40 px-3 py-1.5">
-                                    <span className="text-xs text-zinc-300">
+                                  <div className="flex items-center justify-between rounded-lg bg-overlay px-3 py-1.5">
+                                    <span className="text-xs text-primary">
                                       {homeName}{" "}
-                                      <span className={`font-mono ${oddsColor(homePos!.line)}`}>{formatOdds(homePos!.line)}</span>
+                                      <span className={`font-mono ${oddsColor(homePos!.line)}`}>
+                                        {formatOdds(homePos!.line)}
+                                      </span>
                                     </span>
                                     <div className="flex items-center gap-1.5">
                                       <span className={`font-mono text-sm font-semibold ${oddsColor(homePos!.pick!.odds_am)}`}>
                                         {formatOdds(homePos!.pick!.odds_am)}
                                       </span>
-                                      <span className="rounded-full bg-zinc-700 px-1.5 py-0.5 text-[10px] font-semibold text-zinc-200">
+                                      <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-semibold text-primary">
                                         {shortBook(homePos!.pick!.book)}
                                       </span>
                                     </div>
                                   </div>
-                                  <div className="flex items-center justify-between rounded-lg bg-zinc-800/40 px-3 py-1.5">
-                                    <span className="text-xs text-zinc-300">
+                                  <div className="flex items-center justify-between rounded-lg bg-overlay px-3 py-1.5">
+                                    <span className="text-xs text-primary">
                                       {awayName}{" "}
-                                      <span className={`font-mono ${oddsColor(awayNeg!.line)}`}>{formatOdds(awayNeg!.line)}</span>
+                                      <span className={`font-mono ${oddsColor(awayNeg!.line)}`}>
+                                        {formatOdds(awayNeg!.line)}
+                                      </span>
                                     </span>
                                     <div className="flex items-center gap-1.5">
                                       <span className={`font-mono text-sm font-semibold ${oddsColor(awayNeg!.pick!.odds_am)}`}>
                                         {formatOdds(awayNeg!.pick!.odds_am)}
                                       </span>
-                                      <span className="rounded-full bg-zinc-700 px-1.5 py-0.5 text-[10px] font-semibold text-zinc-200">
+                                      <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-semibold text-primary">
                                         {shortBook(awayNeg!.pick!.book)}
                                       </span>
                                     </div>
                                   </div>
                                 </div>
                                 {valB != null && (
-                                  <div className="mt-1 flex items-center gap-1.5 pl-1 text-[10px] text-zinc-500">
+                                  <div className="mt-1 flex items-center gap-1.5 pl-1 text-[10px] text-muted-text">
                                     Value: {valueBadge(valB)}
                                   </div>
                                 )}
                               </div>
                             )}
 
-                            {pairA && pairB && (
-                              <div className="border-b border-zinc-800/40 mt-1.5" />
-                            )}
+                            {pairA && pairB && <div className="border-b border-border/60 mt-1.5" />}
                           </div>
                         );
                       })}
@@ -620,38 +714,44 @@ export default function HomePage() {
                   )}
 
                   {totalsOpen && totals.length > 0 && (
-                    <div className="border-t border-zinc-800 px-5 py-3 space-y-1.5">
+                    <div className="border-t border-border px-5 py-3 space-y-1.5">
                       {totals
                         .slice()
-                        .sort((a, b) => (a.line ?? 0) - (b.line ?? 0))
+                        .sort((a, b) => {
+                          const aVal = a.over && a.under ? pairValue(a.over.odds_am, a.under.odds_am) : null;
+                          const bVal = b.over && b.under ? pairValue(b.over.odds_am, b.under.odds_am) : null;
+                          const diff = (bVal ?? -999) - (aVal ?? -999);
+                          if (diff !== 0) return diff;
+                          return (a.line ?? 0) - (b.line ?? 0);
+                        })
                         .map((bl, idx) => {
                           if (!bl.over?.book || !bl.under?.book) return null;
                           const tVal = pairValue(bl.over.odds_am, bl.under.odds_am);
                           return (
                             <div
                               key={`total-${bl.line}-${idx}`}
-                              className="flex items-center justify-between rounded-lg bg-zinc-800/40 px-3 py-1.5"
+                              className="flex items-center justify-between rounded-lg bg-overlay px-3 py-1.5"
                             >
-                              <span className="text-xs font-mono text-zinc-400">
+                              <span className="text-xs font-mono text-muted-text">
                                 {bl.line != null ? `Total ${bl.line}` : "Total"}
                               </span>
                               <div className="flex items-center gap-3 text-xs">
                                 {tVal != null && valueBadge(tVal)}
                                 <div className="flex items-center gap-1.5">
-                                  <span className="text-[10px] text-zinc-500">O</span>
+                                  <span className="text-[10px] text-secondary">O</span>
                                   <span className={`font-mono ${oddsColor(bl.over.odds_am)}`}>
                                     {formatOdds(bl.over.odds_am)}
                                   </span>
-                                  <span className="rounded-full bg-zinc-700 px-1.5 py-0.5 text-[10px] font-semibold text-zinc-200">
+                                  <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-semibold text-primary">
                                     {shortBook(bl.over.book)}
                                   </span>
                                 </div>
                                 <div className="flex items-center gap-1.5">
-                                  <span className="text-[10px] text-zinc-500">U</span>
+                                  <span className="text-[10px] text-secondary">U</span>
                                   <span className={`font-mono ${oddsColor(bl.under.odds_am)}`}>
                                     {formatOdds(bl.under.odds_am)}
                                   </span>
-                                  <span className="rounded-full bg-zinc-700 px-1.5 py-0.5 text-[10px] font-semibold text-zinc-200">
+                                  <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-semibold text-primary">
                                     {shortBook(bl.under.book)}
                                   </span>
                                 </div>
@@ -663,10 +763,14 @@ export default function HomePage() {
                   )}
 
                   {propsOpen && props.length > 0 && (
-                    <div className="border-t border-zinc-800 px-5 py-3 space-y-1.5">
+                    <div className="border-t border-border px-5 py-3 space-y-1.5">
                       {props
                         .slice()
                         .sort((a, b) => {
+                          const aVal = a.over && a.under ? pairValue(a.over.odds_am, a.under.odds_am) : null;
+                          const bVal = b.over && b.under ? pairValue(b.over.odds_am, b.under.odds_am) : null;
+                          const diff = (bVal ?? -999) - (aVal ?? -999);
+                          if (diff !== 0) return diff;
                           const pCmp = (a.player ?? "").localeCompare(b.player ?? "");
                           if (pCmp !== 0) return pCmp;
                           const tCmp = (a.prop_type ?? "").localeCompare(b.prop_type ?? "");
@@ -680,31 +784,32 @@ export default function HomePage() {
                           return (
                             <div
                               key={`prop-${bl.player}-${bl.prop_type}-${bl.line}-${idx}`}
-                              className="flex flex-col gap-1 rounded-lg bg-zinc-800/40 px-3 py-2"
+                              className="flex flex-col gap-1 rounded-lg bg-overlay px-3 py-2"
                             >
                               <div className="flex items-center justify-between gap-3">
-                                <span className="text-xs font-semibold text-zinc-200">
-                                  {bl.player ?? "Player"} - <span className="text-zinc-400 capitalize">{propLabel}</span>
+                                <span className="text-xs font-semibold text-primary">
+                                  {bl.player ?? "Player"} -{" "}
+                                  <span className="text-secondary capitalize">{propLabel}</span>
                                   {bl.line != null ? ` ${bl.line}` : ""}
                                 </span>
                                 {pVal != null && valueBadge(pVal)}
                               </div>
                               <div className="flex items-center gap-3 text-xs">
                                 <div className="flex items-center gap-1.5">
-                                  <span className="text-[10px] text-zinc-500">O</span>
+                                  <span className="text-[10px] text-secondary">O</span>
                                   <span className={`font-mono ${oddsColor(bl.over.odds_am)}`}>
                                     {formatOdds(bl.over.odds_am)}
                                   </span>
-                                  <span className="rounded-full bg-zinc-700 px-1.5 py-0.5 text-[10px] font-semibold text-zinc-200">
+                                  <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-semibold text-primary">
                                     {shortBook(bl.over.book)}
                                   </span>
                                 </div>
                                 <div className="flex items-center gap-1.5">
-                                  <span className="text-[10px] text-zinc-500">U</span>
+                                  <span className="text-[10px] text-secondary">U</span>
                                   <span className={`font-mono ${oddsColor(bl.under.odds_am)}`}>
                                     {formatOdds(bl.under.odds_am)}
                                   </span>
-                                  <span className="rounded-full bg-zinc-700 px-1.5 py-0.5 text-[10px] font-semibold text-zinc-200">
+                                  <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-semibold text-primary">
                                     {shortBook(bl.under.book)}
                                   </span>
                                 </div>
@@ -714,12 +819,14 @@ export default function HomePage() {
                         })}
                     </div>
                   )}
-                </div>
+                </Card>
               );
             })
           )}
         </section>
       )}
+      </div>
+    </div>
 
     </main>
   );

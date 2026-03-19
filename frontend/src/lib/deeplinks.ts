@@ -15,6 +15,12 @@ export function buildDeepLink(bookName: string, teamName: string): string {
       return `https://sportsbook.fanduel.com/search?query=${q}`;
     case "betmgm":
       return `https://sports.betmgm.com/en/sports?q=${q}`;
+    case "kalshi":
+      return "https://kalshi.com/browse/sports";
+    case "polymarket":
+      return "https://polymarket.com/sports";
+    case "bovada":
+      return "https://www.bovada.lv/sports";
     default:
       return "#";
   }

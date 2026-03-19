@@ -3,6 +3,9 @@ import type { Arb } from "@/lib/types";
 import { bookLogoPath } from "@/lib/books";
 import { espnTeamLogoUrl, initials, parseMatchup } from "@/lib/teams";
 import { buildDeepLink } from "@/lib/deeplinks";
+import { Card } from "@/components/ui/card";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { Badge } from "@/components/ui/badge";
 
 function formatProfit(p: number): string {
   const sign = p > 0 ? "+" : "";
@@ -21,13 +24,11 @@ export function ArbCard({ arb }: { arb: Arb }) {
   const homeLogo = espnTeamLogoUrl(league, home);
 
   return (
-    <div className="rounded-2xl border border-zinc-800 bg-zinc-900/40 shadow-card">
-      <div className="flex flex-wrap items-center justify-between gap-3 border-b border-zinc-800 px-5 py-4">
+    <Card className="rounded-xl border border-subtle bg-surface shadow-card transition-all duration-200 hover:shadow-card-hover hover:border-emphasis">
+      <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border px-5 py-4">
         <div className="flex items-center gap-3">
-          <span className="inline-flex items-center rounded-full bg-zinc-800/70 px-2.5 py-1 text-xs font-semibold text-zinc-200">
-            {arb.sport}
-          </span>
-          <span className="text-sm text-zinc-300">
+          <Badge variant="neutral">{arb.sport}</Badge>
+          <span className="text-sm text-secondary">
             {arb.market_kind === "ml"
               ? "Moneyline"
               : arb.market_kind === "spread"
@@ -40,8 +41,10 @@ export function ArbCard({ arb }: { arb: Arb }) {
 
         <div className="flex items-center gap-3">
           <div className="text-right">
-            <div className="text-xs text-zinc-400">Profit</div>
-            <div className="text-lg font-bold tracking-tight text-emerald-300">{formatProfit(arb.profit)}</div>
+            <div className="text-xs text-secondary">Profit</div>
+            <div className="text-lg font-bold tracking-tight text-accent-green">
+              {formatProfit(arb.profit)}
+            </div>
           </div>
         </div>
       </div>
@@ -49,31 +52,31 @@ export function ArbCard({ arb }: { arb: Arb }) {
       <div className="px-5 py-4">
         <div className="flex items-center justify-between gap-4">
           <div className="flex items-center gap-3">
-            <div className="relative h-9 w-9 overflow-hidden rounded-full bg-zinc-800">
+            <div className="relative h-9 w-9 overflow-hidden rounded-full border border-border bg-surface">
               {awayLogo ? (
                 <Image src={awayLogo} alt={away} fill sizes="36px" />
               ) : (
-                <div className="grid h-full w-full place-items-center text-xs font-bold text-zinc-200">
+                <div className="grid h-full w-full place-items-center text-xs font-bold text-secondary">
                   {initials(away)}
                 </div>
               )}
             </div>
             <div>
-              <div className="text-sm font-semibold leading-tight text-zinc-100">{away}</div>
-              <div className="text-xs text-zinc-400">@</div>
+              <div className="text-sm font-semibold leading-tight text-primary">{away}</div>
+              <div className="text-xs text-secondary">@</div>
             </div>
           </div>
 
           <div className="flex items-center gap-3">
             <div>
-              <div className="text-sm font-semibold leading-tight text-zinc-100 text-right">{home}</div>
-              <div className="text-xs text-zinc-400 text-right">Home</div>
+              <div className="text-sm font-semibold leading-tight text-primary text-right">{home}</div>
+              <div className="text-xs text-secondary text-right">Home</div>
             </div>
-            <div className="relative h-9 w-9 overflow-hidden rounded-full bg-zinc-800">
+            <div className="relative h-9 w-9 overflow-hidden rounded-full border border-border bg-surface">
               {homeLogo ? (
                 <Image src={homeLogo} alt={home} fill sizes="36px" />
               ) : (
-                <div className="grid h-full w-full place-items-center text-xs font-bold text-zinc-200">
+                <div className="grid h-full w-full place-items-center text-xs font-bold text-secondary">
                   {initials(home)}
                 </div>
               )}
@@ -102,12 +105,12 @@ export function ArbCard({ arb }: { arb: Arb }) {
         </div>
 
         {arb.same_book ? (
-          <div className="mt-3 text-xs text-amber-300/90">
+          <div className="mt-3 text-xs text-accent-amber">
             Note: both legs are from the same book. Treat as low-confidence / likely unbettable.
           </div>
         ) : null}
       </div>
-    </div>
+    </Card>
   );
 }
 
@@ -124,22 +127,29 @@ function LegBlock(props: {
   const { home } = parseMatchup(props.game);
   const deepLink = buildDeepLink(props.book, home);
 
+  const oddsClass =
+    props.odds > 0
+      ? "tabular-nums text-[#34D399]"
+      : props.odds < 0
+        ? "tabular-nums text-[#F87171]"
+        : "tabular-nums text-secondary";
+
   return (
     <div
       className={[
-        "rounded-xl border bg-zinc-950/40 p-4",
-        props.danger ? "border-amber-600/50" : "border-zinc-800",
+        "rounded-lg border border-subtle bg-surface p-4",
+        props.danger ? "border-accent-amber/60" : "border-border",
       ].join(" ")}
     >
       <div className="flex items-start justify-between gap-3">
         <div>
-          <div className="text-xs font-semibold text-zinc-400">{props.label}</div>
-          <div className="mt-0.5 text-sm font-semibold text-zinc-100">{props.side}</div>
+          <div className="text-xs font-semibold text-secondary">{props.label}</div>
+          <div className="mt-0.5 text-sm font-semibold text-primary">{props.side}</div>
           <a
             href={deepLink}
             target="_blank"
             rel="noopener noreferrer"
-            className="mt-1 inline-flex items-center gap-1.5 text-xs text-emerald-400 hover:text-emerald-300 transition group"
+            className="mt-1 inline-flex items-center gap-1.5 text-xs text-secondary hover:text-primary transition group"
           >
             {props.book}
             <svg
@@ -157,20 +167,29 @@ function LegBlock(props: {
           </a>
         </div>
 
-        <a href={deepLink} target="_blank" rel="noopener noreferrer">
-          <div className="relative h-8 w-8 overflow-hidden rounded-md bg-zinc-900 hover:ring-2 hover:ring-emerald-500/50 transition">
-            <Image src={logo} alt={props.book} fill sizes="32px" />
-          </div>
-        </a>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <a href={deepLink} target="_blank" rel="noopener noreferrer" aria-label={`Open ${props.book}`}>
+              <div className="relative h-8 w-8 overflow-hidden rounded border border-border bg-surface hover:ring-2 hover:ring-emphasis/30 transition">
+                <Image src={logo} alt={props.book} fill sizes="32px" />
+              </div>
+            </a>
+          </TooltipTrigger>
+          <TooltipContent side="top">
+            Open {props.book}
+          </TooltipContent>
+        </Tooltip>
       </div>
 
       <div className="mt-3 flex items-end justify-between">
-        <div className="text-2xl font-extrabold tracking-tight text-zinc-50">
+        <div className={`text-2xl font-extrabold font-mono tracking-tight ${oddsClass}`}>
           {formatOddsAm(props.odds)}
         </div>
         <div className="text-right">
-          <div className="text-[11px] text-zinc-400">Stake</div>
-          <div className="text-sm font-semibold text-zinc-100">${props.stake.toFixed(2)}</div>
+          <div className="text-[11px] text-secondary">Stake</div>
+          <div className="text-sm font-semibold text-primary font-mono tracking-tight">
+            ${props.stake.toFixed(2)}
+          </div>
         </div>
       </div>
     </div>
