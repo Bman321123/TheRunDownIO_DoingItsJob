@@ -7,7 +7,6 @@ import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { UnderlineTabs } from "@/components/ui/underline-tabs";
 import { AnimatedTextReveal } from "@/components/ui/animated-text-reveal";
-import { Badge } from "@/components/ui/badge";
 
 const DEFAULT_BASE = "http://127.0.0.1:3030";
 
@@ -338,66 +337,9 @@ export default function HomePage() {
               }, new Map<string, BestLine[]>())
             )
               .map(([key, linesForEvent]) => {
-                // Order events by best (highest) both-sides ROI% across all markets.
-                const amToDec = (am: number) =>
-                  am >= 100 ? am / 100 + 1 : am <= -100 ? 100 / Math.abs(am) + 1 : 0;
-                const pairValue = (oddsA: number, oddsB: number) => {
-                  const decA = amToDec(oddsA);
-                  const decB = amToDec(oddsB);
-                  if (decA <= 1 || decB <= 1) return null;
-                  return Math.round((1 - (1 / decA + 1 / decB)) * 10000) / 100;
-                };
-
-                const ml = linesForEvent.filter((l) => l.type === "moneyline");
-                const spreads = linesForEvent.filter((l) => l.type === "spread");
-                const totals = linesForEvent.filter((l) => l.type === "total");
-                const props = linesForEvent.filter((l) => l.type === "prop");
-
-                let best = -Infinity;
-
-                for (const bl of ml) {
-                  if (!bl.home?.odds_am || !bl.away?.odds_am) continue;
-                  const v = pairValue(bl.home.odds_am, bl.away.odds_am);
-                  if (v != null) best = Math.max(best, v);
-                }
-                for (const bl of totals) {
-                  if (!bl.over?.odds_am || !bl.under?.odds_am) continue;
-                  const v = pairValue(bl.over.odds_am, bl.under.odds_am);
-                  if (v != null) best = Math.max(best, v);
-                }
-                for (const bl of props) {
-                  if (!bl.over?.odds_am || !bl.under?.odds_am) continue;
-                  const v = pairValue(bl.over.odds_am, bl.under.odds_am);
-                  if (v != null) best = Math.max(best, v);
-                }
-
-                // For spreads, compute best ROI across paired home/away lines by abs(line).
-                const byAbs = new Map<number, BestLine[]>();
-                for (const s of spreads) {
-                  if (s.line == null || !s.pick?.odds_am || !s.side) continue;
-                  const abs = Math.abs(s.line);
-                  const list = byAbs.get(abs) ?? [];
-                  list.push(s);
-                  byAbs.set(abs, list);
-                }
-                for (const [, entries] of byAbs.entries()) {
-                  const homeNeg = entries.find((e) => e.side === "home" && (e.line ?? 0) < 0);
-                  const awayPos = entries.find((e) => e.side === "away" && (e.line ?? 0) > 0);
-                  const homePos = entries.find((e) => e.side === "home" && (e.line ?? 0) > 0);
-                  const awayNeg = entries.find((e) => e.side === "away" && (e.line ?? 0) < 0);
-                  if (homeNeg?.pick?.odds_am != null && awayPos?.pick?.odds_am != null) {
-                    const v = pairValue(homeNeg.pick.odds_am, awayPos.pick.odds_am);
-                    if (v != null) best = Math.max(best, v);
-                  }
-                  if (homePos?.pick?.odds_am != null && awayNeg?.pick?.odds_am != null) {
-                    const v = pairValue(homePos.pick.odds_am, awayNeg.pick.odds_am);
-                    if (v != null) best = Math.max(best, v);
-                  }
-                }
-
-                return { key, linesForEvent, score: Number.isFinite(best) ? best : -999 };
+                return { key, linesForEvent };
               })
-              .sort((a, b) => (b.score - a.score) || a.key.localeCompare(b.key))
+              .sort((a, b) => a.key.localeCompare(b.key))
               .map(({ key, linesForEvent }) => {
               const [sport, game] = key.split("::");
               const ml = linesForEvent.filter((l) => l.type === "moneyline");
@@ -433,28 +375,6 @@ export default function HomePage() {
                   : v > 0
                     ? "font-bold tabular-nums text-[#34D399]"
                     : "font-bold tabular-nums text-[#F87171]";
-              const amToDec = (am: number) =>
-                am >= 100 ? am / 100 + 1 : am <= -100 ? 100 / Math.abs(am) + 1 : 0;
-              const pairValue = (oddsA: number, oddsB: number) => {
-                const decA = amToDec(oddsA);
-                const decB = amToDec(oddsB);
-                if (decA <= 1 || decB <= 1) return null;
-                return Math.round((1 - (1 / decA + 1 / decB)) * 10000) / 100;
-              };
-              const valueBadge = (val: number | null) => {
-                if (val == null) return null;
-                const positive = val >= 0;
-                return (
-                  <Badge
-                    variant={positive ? "success" : "danger"}
-                    className="font-mono text-[11px] font-bold"
-                  >
-                    {positive ? "+" : ""}
-                    {val.toFixed(1)}%
-                  </Badge>
-                );
-              };
-
               const homeName = ml[0]?.home_team ?? spreads.find((s) => s.side === "home")?.team ?? "Home";
               const awayName = ml[0]?.away_team ?? spreads.find((s) => s.side === "away")?.team ?? "Away";
 
@@ -467,21 +387,7 @@ export default function HomePage() {
                   list.push(s);
                   byAbs.set(abs, list);
                 }
-                // Highest ROI% first (fallback: smaller abs line first).
-                return Array.from(byAbs.entries()).sort(([absA, entriesA], [absB, entriesB]) => {
-                  const bestFor = (entries: BestLine[]) => {
-                    const homeNeg = entries.find((e) => e.side === "home" && (e.line ?? 0) < 0);
-                    const awayPos = entries.find((e) => e.side === "away" && (e.line ?? 0) > 0);
-                    const homePos = entries.find((e) => e.side === "home" && (e.line ?? 0) > 0);
-                    const awayNeg = entries.find((e) => e.side === "away" && (e.line ?? 0) < 0);
-                    const vA = homeNeg && awayPos ? pairValue(homeNeg.pick!.odds_am, awayPos.pick!.odds_am) : null;
-                    const vB = homePos && awayNeg ? pairValue(homePos.pick!.odds_am, awayNeg.pick!.odds_am) : null;
-                    return Math.max(vA ?? -999, vB ?? -999);
-                  };
-                  const diff = bestFor(entriesB) - bestFor(entriesA);
-                  if (diff !== 0) return diff;
-                  return absA - absB;
-                });
+                return Array.from(byAbs.entries()).sort(([absA], [absB]) => absA - absB);
               })();
 
               return (
@@ -500,7 +406,6 @@ export default function HomePage() {
                     {ml.length > 0 && ml.map((bl, idx) => {
                       if (!bl.home || !bl.away || !bl.home_team || !bl.away_team) return null;
                       if (bl.home.odds_am == null || bl.away.odds_am == null) return null;
-                      const mlVal = pairValue(bl.home.odds_am, bl.away.odds_am);
                       return (
                         <div key={`ml-${idx}`} className="mt-3">
                           <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
@@ -533,11 +438,6 @@ export default function HomePage() {
                               </div>
                             </div>
                           </div>
-                          {mlVal != null && (
-                            <div className="mt-1.5 flex items-center gap-2 text-[10px] text-muted-text">
-                              <span>Both-sides value:</span> {valueBadge(mlVal)}
-                            </div>
-                          )}
                         </div>
                       );
                     })}
@@ -609,9 +509,6 @@ export default function HomePage() {
                         const pairA = homeNeg && awayPos;
                         const pairB = homePos && awayNeg;
                         if (!pairA && !pairB) return null;
-                        const valA = pairA ? pairValue(homeNeg!.pick!.odds_am, awayPos!.pick!.odds_am) : null;
-                        const valB = pairB ? pairValue(homePos!.pick!.odds_am, awayNeg!.pick!.odds_am) : null;
-
                         return (
                           <div key={`sp-${absLine}`} className="space-y-1.5">
                               <div className="text-[10px] uppercase tracking-wider text-secondary font-semibold">
@@ -654,11 +551,6 @@ export default function HomePage() {
                                     </div>
                                   </div>
                                 </div>
-                                {valA != null && (
-                                  <div className="mt-1 flex items-center gap-1.5 pl-1 text-[10px] text-muted-text">
-                                    Value: {valueBadge(valA)}
-                                  </div>
-                                )}
                               </div>
                             )}
 
@@ -698,11 +590,6 @@ export default function HomePage() {
                                     </div>
                                   </div>
                                 </div>
-                                {valB != null && (
-                                  <div className="mt-1 flex items-center gap-1.5 pl-1 text-[10px] text-muted-text">
-                                    Value: {valueBadge(valB)}
-                                  </div>
-                                )}
                               </div>
                             )}
 
@@ -717,16 +604,9 @@ export default function HomePage() {
                     <div className="border-t border-border px-5 py-3 space-y-1.5">
                       {totals
                         .slice()
-                        .sort((a, b) => {
-                          const aVal = a.over && a.under ? pairValue(a.over.odds_am, a.under.odds_am) : null;
-                          const bVal = b.over && b.under ? pairValue(b.over.odds_am, b.under.odds_am) : null;
-                          const diff = (bVal ?? -999) - (aVal ?? -999);
-                          if (diff !== 0) return diff;
-                          return (a.line ?? 0) - (b.line ?? 0);
-                        })
+                        .sort((a, b) => (a.line ?? 0) - (b.line ?? 0))
                         .map((bl, idx) => {
                           if (!bl.over?.book || !bl.under?.book) return null;
-                          const tVal = pairValue(bl.over.odds_am, bl.under.odds_am);
                           return (
                             <div
                               key={`total-${bl.line}-${idx}`}
@@ -736,7 +616,6 @@ export default function HomePage() {
                                 {bl.line != null ? `Total ${bl.line}` : "Total"}
                               </span>
                               <div className="flex items-center gap-3 text-xs">
-                                {tVal != null && valueBadge(tVal)}
                                 <div className="flex items-center gap-1.5">
                                   <span className="text-[10px] text-secondary">O</span>
                                   <span className={`font-mono ${oddsColor(bl.over.odds_am)}`}>
@@ -767,10 +646,6 @@ export default function HomePage() {
                       {props
                         .slice()
                         .sort((a, b) => {
-                          const aVal = a.over && a.under ? pairValue(a.over.odds_am, a.under.odds_am) : null;
-                          const bVal = b.over && b.under ? pairValue(b.over.odds_am, b.under.odds_am) : null;
-                          const diff = (bVal ?? -999) - (aVal ?? -999);
-                          if (diff !== 0) return diff;
                           const pCmp = (a.player ?? "").localeCompare(b.player ?? "");
                           if (pCmp !== 0) return pCmp;
                           const tCmp = (a.prop_type ?? "").localeCompare(b.prop_type ?? "");
@@ -779,7 +654,6 @@ export default function HomePage() {
                         })
                         .map((bl, idx) => {
                           if (!bl.over?.book || !bl.under?.book) return null;
-                          const pVal = pairValue(bl.over.odds_am, bl.under.odds_am);
                           const propLabel = (bl.prop_type ?? "prop").replace(/^player_/, "").replace(/_/g, " ");
                           return (
                             <div
@@ -792,7 +666,6 @@ export default function HomePage() {
                                   <span className="text-secondary capitalize">{propLabel}</span>
                                   {bl.line != null ? ` ${bl.line}` : ""}
                                 </span>
-                                {pVal != null && valueBadge(pVal)}
                               </div>
                               <div className="flex items-center gap-3 text-xs">
                                 <div className="flex items-center gap-1.5">

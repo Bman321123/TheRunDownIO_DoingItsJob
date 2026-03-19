@@ -28,6 +28,13 @@ export function ArbCard({ arb }: { arb: Arb }) {
       <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border px-5 py-4">
         <div className="flex items-center gap-3">
           <Badge variant="neutral">{arb.sport}</Badge>
+          {arb.arb_source === "live" ? (
+            <Badge variant="success" className="text-[10px]">Live</Badge>
+          ) : arb.arb_source === "combined" ? (
+            <Badge variant="info" className="text-[10px]">Mixed</Badge>
+          ) : arb.arb_source === "rundown" ? (
+            <Badge variant="neutral" className="text-[10px]">Rundown</Badge>
+          ) : null}
           <span className="text-sm text-secondary">
             {arb.market_kind === "ml"
               ? "Moneyline"

@@ -21,6 +21,7 @@ export type Arb = {
   same_book?: boolean;
   fresh_age_s?: number | null;
   stale_age_s?: number | null;
+  arb_source?: "live" | "combined" | "rundown";
 };
 
 export type RawLine = {

@@ -16,6 +16,9 @@ from typing import Any
 POLY_BASE  = "https://gamma-api.polymarket.com"
 TIMEOUT_S  = 12
 
+# Platform fee rate — applied to PROFIT, not settlement value
+POLYMARKET_FEE_RATE: float = 0.02  # 2% of profit (taker)
+
 _SPORT_TO_SERIES: dict[str, list[str]] = {
     "nba":    ["10345"],
     "nfl":    ["10187"],
@@ -31,12 +34,24 @@ ALL_SPORT_KEYS = list(_SPORT_TO_SERIES.keys())
 
 
 def _prob_to_american(prob: float) -> int | None:
-    """Decimal probability (0.0-1.0) -> American odds integer."""
+    """
+    Polymarket price (0.0-1.0) -> American odds integer after fees.
+
+    Fee is applied to PROFIT (net payout), not settlement value:
+        net_payout   = 1 - fee_rate × (1 - prob)
+        decimal_odds = net_payout / prob
+    """
     if prob <= 0.01 or prob >= 0.99:
         return None
-    if prob >= 0.5:
-        return round(-prob / (1 - prob) * 100)
-    return round((1 - prob) / prob * 100)
+
+    net_payout = 1.0 - POLYMARKET_FEE_RATE * (1.0 - prob)
+    dec = net_payout / prob
+    if dec <= 1.0:
+        return None
+
+    if dec >= 2.0:
+        return round((dec - 1) * 100)
+    return round(-100 / (dec - 1))
 
 
 def fetch_polymarket_markets(sport_keys: list[str] | None = None) -> list[dict[str, Any]]:

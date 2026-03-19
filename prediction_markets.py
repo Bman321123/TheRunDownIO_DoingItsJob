@@ -73,6 +73,14 @@ CLOB_WORKERS    = 10
 # Polymarket CLOB: market depth minimum for a valid ask price
 CLOB_MIN_SIZE   = 1.0   # $1 minimum depth — below this treat as illiquid
 
+# Platform fee rates — applied to PROFIT, not settlement value
+#
+# Formula (for a 0-1 ask price):
+#   net_payout   = 1 - fee_rate * (1 - ask)
+#   decimal_odds = net_payout / ask
+POLYMARKET_FEE_RATE: float = 0.02   # 2% of profit (taker)
+KALSHI_FEE_RATE: float     = 0.07   # ~7% of profit for sports taker orders
+
 # ─────────────────────────────────────────────
 # SPORT → SERIES / TAG MAPPINGS
 # ─────────────────────────────────────────────
@@ -125,11 +133,25 @@ _SPORT_TO_POLY_SERIES: dict[str, list[str]] = {
 # PRICE CONVERSION
 # ─────────────────────────────────────────────
 
-def pm_price_to_decimal(ask: float) -> float:
-    """Convert 0–1 prediction market ask price to decimal odds."""
+def pm_price_to_decimal(ask: float, fee_rate: float = 0.0) -> float:
+    """
+    Convert a 0–1 prediction market ask price to decimal odds after fees.
+
+    fee_rate: fraction of PROFIT taken as platform fee.
+              e.g. POLYMARKET_FEE_RATE = 0.02, KALSHI_FEE_RATE = 0.07
+
+    Formula:
+        net_payout   = 1 - fee_rate × (1 - ask)
+        decimal_odds = net_payout / ask
+    """
     if ask <= 0 or ask >= 1:
         return 0.0
-    return round(1.0 / ask, 6)
+
+    net_payout = 1.0 - fee_rate * (1.0 - ask)
+    if net_payout <= 0:
+        return 0.0
+
+    return round(net_payout / ask, 6)
 
 
 def decimal_to_american(dec: float) -> int:
@@ -141,9 +163,9 @@ def decimal_to_american(dec: float) -> int:
     return int(round(-100 / (dec - 1)))
 
 
-def pm_price_to_american(ask: float) -> int:
-    """Shortcut: 0–1 ask price → American odds integer."""
-    dec = pm_price_to_decimal(ask)
+def pm_price_to_american(ask: float, fee_rate: float = 0.0) -> int:
+    """Shortcut: 0–1 ask price → American odds integer, after fees."""
+    dec = pm_price_to_decimal(ask, fee_rate=fee_rate)
     if dec <= 1.0:
         return 0
     return decimal_to_american(dec)
@@ -672,6 +694,70 @@ def _classify_kalshi_market_type(subtitle: str, title: str) -> tuple[str, str | 
 # KALSHI — FETCH & PARSE
 # ─────────────────────────────────────────────
 
+def _walk_kalshi_yes_ask_from_orderbook(
+    orderbook_fp: dict[str, Any],
+    min_notional: float,
+) -> float | None:
+    """
+    Walk executable YES ask from Kalshi orderbook levels.
+
+    Kalshi orderbook endpoint returns bids only. YES asks are derived from NO
+    bids with the identity: yes_ask = 1 - no_bid.
+    """
+    no_levels = orderbook_fp.get("no_dollars") or []
+    if not isinstance(no_levels, list):
+        return None
+
+    cum_notional = 0.0
+    worst_yes_ask = None
+    for level in no_levels:
+        if not isinstance(level, (list, tuple)) or len(level) < 2:
+            continue
+        no_bid = _safe_float(level[0])
+        size = _safe_float(level[1])
+        if no_bid is None or size is None or size <= 0:
+            continue
+        yes_ask = 1.0 - no_bid
+        if not (0 < yes_ask < 1):
+            continue
+
+        cum_notional += yes_ask * size
+        worst_yes_ask = yes_ask
+        if cum_notional >= min_notional:
+            return worst_yes_ask
+    return None
+
+
+async def _fetch_kalshi_executable_yes_ask(
+    session: aiohttp.ClientSession,
+    api_key: str,
+    private_key,
+    market_ticker: str,
+    orderbook_cache: dict[str, float | None],
+    min_notional: float = CLOB_MIN_SIZE,
+) -> float | None:
+    """Fetch executable YES ask by walking Kalshi orderbook depth."""
+    if not market_ticker:
+        return None
+    if market_ticker in orderbook_cache:
+        return orderbook_cache[market_ticker]
+
+    path = f"/trade-api/v2/markets/{market_ticker}/orderbook"
+    headers = _kalshi_auth_headers(api_key, private_key, "GET", path)
+    ask_value: float | None = None
+    try:
+        url = KALSHI_BASE_URL + path
+        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=12)) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                orderbook_fp = data.get("orderbook_fp") or {}
+                ask_value = _walk_kalshi_yes_ask_from_orderbook(orderbook_fp, min_notional=min_notional)
+    except Exception as e:
+        logger.debug("Kalshi orderbook fetch failed ticker=%s: %s", market_ticker, e)
+
+    orderbook_cache[market_ticker] = ask_value
+    return ask_value
+
 async def _fetch_kalshi_series(
     session: aiohttp.ClientSession,
     series_ticker: str,
@@ -683,6 +769,8 @@ async def _fetch_kalshi_series(
     """Fetch all open events for one Kalshi series. Paginated."""
     events_out: list[dict] = []
     cursor: str | None = None
+
+    orderbook_cache: dict[str, float | None] = {}
 
     while True:
         path = f"/trade-api/v2/events"
@@ -715,6 +803,35 @@ async def _fetch_kalshi_series(
             break
 
         raw_events = data.get("events") or []
+        for raw in raw_events:
+            for m in raw.get("markets") or []:
+                if m.get("status") not in ("open", "active") or m.get("result"):
+                    continue
+
+                executable_ask = None
+                ask_dollars = _safe_float(m.get("yes_ask_dollars"))
+                ask_size_fp = _safe_float(m.get("yes_ask_size_fp"))
+                if ask_dollars is not None:
+                    top_notional = ask_dollars * ask_size_fp if ask_size_fp is not None else 0.0
+                    if top_notional >= CLOB_MIN_SIZE:
+                        executable_ask = ask_dollars
+                    else:
+                        ticker = str(m.get("ticker") or "")
+                        executable_ask = await _fetch_kalshi_executable_yes_ask(
+                            session,
+                            api_key,
+                            private_key,
+                            ticker,
+                            orderbook_cache,
+                            min_notional=CLOB_MIN_SIZE,
+                        )
+                else:
+                    # Last-resort legacy fallback if *_dollars is absent.
+                    executable_ask = _safe_float(m.get("yes_ask"))
+
+                m["_executable_yes_ask"] = executable_ask
+                m["_executable_yes_ask_checked"] = True
+
         for raw in raw_events:
             parsed = _parse_kalshi_event(raw, sport, fetch_ts)
             if parsed:
@@ -779,12 +896,12 @@ def _parse_kalshi_event(raw: dict, sport: str, fetch_ts: str) -> list[dict]:
         sub_a = (team_a_m.get("yes_sub_title") or team_a_m.get("subtitle") or "").strip()
         sub_b = (team_b_m.get("yes_sub_title") or team_b_m.get("subtitle") or "").strip()
 
-        yes_ask_a = _safe_float(team_a_m.get("yes_ask")) or _safe_float(team_a_m.get("yes_ask_dollars"))
-        yes_ask_b = _safe_float(team_b_m.get("yes_ask")) or _safe_float(team_b_m.get("yes_ask_dollars"))
+        yes_ask_a = _safe_float(team_a_m.get("_executable_yes_ask"))
+        yes_ask_b = _safe_float(team_b_m.get("_executable_yes_ask"))
 
         if yes_ask_a and yes_ask_b and sub_a and sub_b:
-            dec_a = pm_price_to_decimal(yes_ask_a)
-            dec_b = pm_price_to_decimal(yes_ask_b)
+            dec_a = pm_price_to_decimal(yes_ask_a, fee_rate=KALSHI_FEE_RATE)
+            dec_b = pm_price_to_decimal(yes_ask_b, fee_rate=KALSHI_FEE_RATE)
             if dec_a > 1.0 and dec_b > 1.0:
                 # Try to determine home/away from title
                 teams_from_title = _parse_teams_from_title(title)
@@ -804,6 +921,74 @@ def _parse_kalshi_event(raw: dict, sport: str, fetch_ts: str) -> list[dict]:
                     home_ask, away_ask = yes_ask_a, yes_ask_b
                     home_dec, away_dec = dec_a, dec_b
 
+                moneyline_markets: list[dict[str, Any]] = [
+                    {
+                        "market_type": "moneyline",
+                        "selection": "home",
+                        "team": home_team,
+                        "american_odds": decimal_to_american(home_dec),
+                        "decimal_odds": home_dec,
+                        "line_value": None,
+                        "source": "kalshi",
+                        "_contract_type": "YES",
+                        "_source_book": "kalshi",
+                        "ask_price": home_ask,
+                        "updated_at": fetch_ts,
+                    },
+                    {
+                        "market_type": "moneyline",
+                        "selection": "away",
+                        "team": away_team,
+                        "american_odds": decimal_to_american(away_dec),
+                        "decimal_odds": away_dec,
+                        "line_value": None,
+                        "source": "kalshi",
+                        "_contract_type": "YES",
+                        "_source_book": "kalshi",
+                        "ask_price": away_ask,
+                        "updated_at": fetch_ts,
+                    },
+                ]
+
+                # Parse Kalshi NO contract asks. NO on one team means the
+                # opposing team wins, so selection is the opposite side.
+                no_ask_a = _first_valid_price(team_a_m.get("no_ask_dollars"), team_a_m.get("no_ask"))
+                no_ask_b = _first_valid_price(team_b_m.get("no_ask_dollars"), team_b_m.get("no_ask"))
+                if no_ask_a:
+                    no_dec_a = pm_price_to_decimal(no_ask_a, fee_rate=KALSHI_FEE_RATE)
+                    if no_dec_a > 1.0:
+                        no_selection_a = "away" if home_team == sub_a else "home"
+                        moneyline_markets.append({
+                            "market_type": "moneyline",
+                            "selection": no_selection_a,
+                            "team": away_team if no_selection_a == "away" else home_team,
+                            "american_odds": decimal_to_american(no_dec_a),
+                            "decimal_odds": no_dec_a,
+                            "line_value": None,
+                            "source": "kalshi",
+                            "_contract_type": "NO",
+                            "_source_book": "kalshi",
+                            "ask_price": no_ask_a,
+                            "updated_at": fetch_ts,
+                        })
+                if no_ask_b:
+                    no_dec_b = pm_price_to_decimal(no_ask_b, fee_rate=KALSHI_FEE_RATE)
+                    if no_dec_b > 1.0:
+                        no_selection_b = "away" if home_team == sub_b else "home"
+                        moneyline_markets.append({
+                            "market_type": "moneyline",
+                            "selection": no_selection_b,
+                            "team": away_team if no_selection_b == "away" else home_team,
+                            "american_odds": decimal_to_american(no_dec_b),
+                            "decimal_odds": no_dec_b,
+                            "line_value": None,
+                            "source": "kalshi",
+                            "_contract_type": "NO",
+                            "_source_book": "kalshi",
+                            "ask_price": no_ask_b,
+                            "updated_at": fetch_ts,
+                        })
+
                 results.append({
                     "source": "kalshi",
                     "sport": sport,
@@ -811,30 +996,7 @@ def _parse_kalshi_event(raw: dict, sport: str, fetch_ts: str) -> list[dict]:
                     "away_team": away_team,
                     "start_time": start_time,
                     "event_url": event_url,
-                    "markets": [
-                        {
-                            "market_type": "moneyline",
-                            "selection": "home",
-                            "team": home_team,
-                            "american_odds": decimal_to_american(home_dec),
-                            "decimal_odds": home_dec,
-                            "line_value": None,
-                            "source": "kalshi",
-                            "ask_price": home_ask,
-                            "updated_at": fetch_ts,
-                        },
-                        {
-                            "market_type": "moneyline",
-                            "selection": "away",
-                            "team": away_team,
-                            "american_odds": decimal_to_american(away_dec),
-                            "decimal_odds": away_dec,
-                            "line_value": None,
-                            "source": "kalshi",
-                            "ask_price": away_ask,
-                            "updated_at": fetch_ts,
-                        },
-                    ],
+                    "markets": moneyline_markets,
                 })
 
     # ── Spread markets ─────────────────────────────────────────────────
@@ -844,10 +1006,10 @@ def _parse_kalshi_event(raw: dict, sport: str, fetch_ts: str) -> list[dict]:
             lv = m.get("_line_value")
             if sel is None or lv is None:
                 continue
-            yes_ask = _safe_float(m.get("yes_ask")) or _safe_float(m.get("yes_ask_dollars"))
+            yes_ask = _safe_float(m.get("_executable_yes_ask"))
             if not yes_ask:
                 continue
-            dec = pm_price_to_decimal(yes_ask)
+            dec = pm_price_to_decimal(yes_ask, fee_rate=KALSHI_FEE_RATE)
             if dec <= 1.0:
                 continue
 
@@ -880,6 +1042,8 @@ def _parse_kalshi_event(raw: dict, sport: str, fetch_ts: str) -> list[dict]:
                 "decimal_odds": dec,
                 "line_value": signed_lv,
                 "source": "kalshi",
+                "_contract_type": "YES",
+                "_source_book": "kalshi",
                 "ask_price": yes_ask,
                 "updated_at": fetch_ts,
             })
@@ -889,12 +1053,12 @@ def _parse_kalshi_event(raw: dict, sport: str, fetch_ts: str) -> list[dict]:
         over_m = next((m for m in total_markets if m.get("_selection") == "over"), None)
         under_m = next((m for m in total_markets if m.get("_selection") == "under"), None)
         if over_m and under_m:
-            over_ask = _safe_float(over_m.get("yes_ask")) or _safe_float(over_m.get("yes_ask_dollars"))
-            under_ask = _safe_float(under_m.get("yes_ask")) or _safe_float(under_m.get("yes_ask_dollars"))
+            over_ask = _safe_float(over_m.get("_executable_yes_ask"))
+            under_ask = _safe_float(under_m.get("_executable_yes_ask"))
             lv = over_m.get("_line_value") or under_m.get("_line_value")
             if over_ask and under_ask and lv:
-                over_dec = pm_price_to_decimal(over_ask)
-                under_dec = pm_price_to_decimal(under_ask)
+                over_dec = pm_price_to_decimal(over_ask, fee_rate=KALSHI_FEE_RATE)
+                under_dec = pm_price_to_decimal(under_ask, fee_rate=KALSHI_FEE_RATE)
                 if over_dec > 1.0 and under_dec > 1.0:
                     teams_from_title = _parse_teams_from_title(title)
                     if teams_from_title:
@@ -924,6 +1088,8 @@ def _parse_kalshi_event(raw: dict, sport: str, fetch_ts: str) -> list[dict]:
                             "decimal_odds": over_dec,
                             "line_value": lv,
                             "source": "kalshi",
+                            "_contract_type": "YES",
+                            "_source_book": "kalshi",
                             "ask_price": over_ask,
                             "updated_at": fetch_ts,
                         },
@@ -935,6 +1101,8 @@ def _parse_kalshi_event(raw: dict, sport: str, fetch_ts: str) -> list[dict]:
                             "decimal_odds": under_dec,
                             "line_value": lv,
                             "source": "kalshi",
+                            "_contract_type": "YES",
+                            "_source_book": "kalshi",
                             "ask_price": under_ask,
                             "updated_at": fetch_ts,
                         },
@@ -1129,8 +1297,8 @@ def _parse_polymarket_event(raw: dict, sport: str, fetch_ts: str) -> dict | None
 
     if mtype == "moneyline":
         # outcome_a / outcome_b = team names
-        dec_a = pm_price_to_decimal(price_a) if price_a > 0 else 0
-        dec_b = pm_price_to_decimal(price_b) if price_b > 0 else 0
+        dec_a = pm_price_to_decimal(price_a, fee_rate=POLYMARKET_FEE_RATE) if price_a > 0 else 0
+        dec_b = pm_price_to_decimal(price_b, fee_rate=POLYMARKET_FEE_RATE) if price_b > 0 else 0
         if dec_a <= 1.0 or dec_b <= 1.0:
             return None
 
@@ -1150,6 +1318,8 @@ def _parse_polymarket_event(raw: dict, sport: str, fetch_ts: str) -> dict | None
                     "decimal_odds": dec_a,
                     "line_value": None,
                     "source": "polymarket",
+                    "_contract_type": "YES",
+                    "_source_book": "polymarket",
                     "ask_price": price_a,   # mid-price placeholder, updated by CLOB
                     "updated_at": fetch_ts,
                     "_clob_token": token_a,
@@ -1162,6 +1332,8 @@ def _parse_polymarket_event(raw: dict, sport: str, fetch_ts: str) -> dict | None
                     "decimal_odds": dec_b,
                     "line_value": None,
                     "source": "polymarket",
+                    "_contract_type": "YES",
+                    "_source_book": "polymarket",
                     "ask_price": price_b,
                     "updated_at": fetch_ts,
                     "_clob_token": token_b,
@@ -1177,8 +1349,8 @@ def _parse_polymarket_event(raw: dict, sport: str, fetch_ts: str) -> dict | None
         sel_a = over_sel if over_sel else "over"
         sel_b = "under"
 
-        dec_a = pm_price_to_decimal(price_a) if price_a > 0 else 0
-        dec_b = pm_price_to_decimal(price_b) if price_b > 0 else 0
+        dec_a = pm_price_to_decimal(price_a, fee_rate=POLYMARKET_FEE_RATE) if price_a > 0 else 0
+        dec_b = pm_price_to_decimal(price_b, fee_rate=POLYMARKET_FEE_RATE) if price_b > 0 else 0
         if dec_a <= 1.0 or dec_b <= 1.0:
             return None
 
@@ -1198,6 +1370,8 @@ def _parse_polymarket_event(raw: dict, sport: str, fetch_ts: str) -> dict | None
                     "decimal_odds": dec_a,
                     "line_value": line_value,
                     "source": "polymarket",
+                    "_contract_type": "YES",
+                    "_source_book": "polymarket",
                     "ask_price": price_a,
                     "updated_at": fetch_ts,
                     "_clob_token": token_a,
@@ -1210,6 +1384,8 @@ def _parse_polymarket_event(raw: dict, sport: str, fetch_ts: str) -> dict | None
                     "decimal_odds": dec_b,
                     "line_value": line_value,
                     "source": "polymarket",
+                    "_contract_type": "YES",
+                    "_source_book": "polymarket",
                     "ask_price": price_b,
                     "updated_at": fetch_ts,
                     "_clob_token": token_b,
@@ -1371,23 +1547,43 @@ async def fetch_polymarket_events(sport_keys: list[str]) -> list[dict]:
 # POLYMARKET — CLOB PRICE UPDATE
 # ─────────────────────────────────────────────
 
-async def _fetch_clob_ask(
+async def _fetch_clob_executable_ask(
     session: aiohttp.ClientSession,
     token_id: str,
 ) -> float | None:
-    """Fetch actual ask price from Polymarket CLOB order book for a token."""
+    """
+    Fetch executable buy price from Polymarket CLOB book for a token.
+
+    We walk asks from best to worse until we can fill CLOB_MIN_SIZE notional.
+    The returned value is the worst ask touched to guarantee an executable fill.
+    """
     if not token_id:
         return None
     try:
-        url = f"{POLYMARKET_CLOB_URL}/price"
-        params = {"token_id": token_id, "side": "buy"}
+        url = f"{POLYMARKET_CLOB_URL}/book"
+        params = {"token_id": token_id}
         async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
             if resp.status != 200:
                 return None
             data = await resp.json()
-            price = _safe_float(data.get("price"))
-            if price and 0 < price < 1:
-                return price
+            asks = data.get("asks") or []
+            if not isinstance(asks, list) or not asks:
+                return None
+
+            cum_notional = 0.0
+            worst_ask = None
+            for level in asks:
+                if not isinstance(level, dict):
+                    continue
+                price = _safe_float(level.get("price"))
+                size = _safe_float(level.get("size"))
+                if price is None or size is None or not (0 < price < 1) or size <= 0:
+                    continue
+
+                cum_notional += price * size
+                worst_ask = price
+                if cum_notional >= CLOB_MIN_SIZE:
+                    return worst_ask
     except Exception as e:
         logger.debug("CLOB fetch token=%s failed: %s", token_id, e)
     return None
@@ -1421,9 +1617,9 @@ async def update_polymarket_clob_prices(events: list[dict]) -> list[dict]:
         async def _update(market: dict):
             async with sem:
                 token = market["_clob_token"]
-                ask = await _fetch_clob_ask(session, token)
+                ask = await _fetch_clob_executable_ask(session, token)
                 if ask and 0 < ask < 1:
-                    dec = pm_price_to_decimal(ask)
+                    dec = pm_price_to_decimal(ask, fee_rate=POLYMARKET_FEE_RATE)
                     if dec > 1.0:
                         market["ask_price"] = ask
                         market["decimal_odds"] = dec
@@ -1432,6 +1628,18 @@ async def update_polymarket_clob_prices(events: list[dict]) -> list[dict]:
                         market["_clob_updated"] = True
 
         await asyncio.gather(*[_update(m) for m in token_markets], return_exceptions=True)
+
+    # Mark any market whose CLOB ask could not be resolved.
+    # Gamma provided only a midpoint, so without a resolved CLOB ask we must
+    # treat this as stale-mid placeholder and exclude it from arb detection.
+    for m in token_markets:
+        if not m.get("_clob_updated"):
+            logger.warning(
+                "Polymarket CLOB miss for token %s — mid-price placeholder remains. "
+                "This market will be excluded from arb detection.",
+                m.get("_clob_token", "unknown"),
+            )
+            m["_price_is_stale_midprice"] = True
 
     updated = sum(1 for m in token_markets if m.get("_clob_updated"))
     logger.info("Polymarket CLOB: updated %d/%d market prices", updated, len(token_markets))
@@ -1472,6 +1680,20 @@ def _safe_float(val: Any) -> float | None:
         return f if f == f else None  # NaN check
     except (ValueError, TypeError):
         return None
+
+
+def _first_valid_price(*field_values) -> float | None:
+    """
+    Return the first non-None float from the provided values.
+
+    Uses explicit None check (NOT falsy check), so 0.0 is treated as valid and
+    does not silently fall back to a different price field.
+    """
+    for v in field_values:
+        f = _safe_float(v)
+        if f is not None:
+            return f
+    return None
 
 
 def _fuzzy_name_match(a: str, b: str) -> float:

@@ -999,6 +999,110 @@ def _best_american_option(options: list[dict[str, Any]]) -> dict[str, Any] | Non
     return None
 
 
+def _merge_best_lines(sources: list[list[dict[str, Any]]]) -> list[dict[str, Any]]:
+    """
+    Merge multiple best_lines lists into one entry per market key.
+
+    For each unique game+market combination, keep the single best odds per side
+    across all sources using American odds shopping rules.
+    """
+
+    def _best_of(a: dict[str, Any] | None, b: dict[str, Any] | None) -> dict[str, Any] | None:
+        if a is None:
+            return b
+        if b is None:
+            return a
+        oa = a.get("odds_am")
+        ob = b.get("odds_am")
+        if not isinstance(oa, int):
+            return b
+        if not isinstance(ob, int):
+            return a
+        if oa > 0 and ob <= 0:
+            return a
+        if ob > 0 and oa <= 0:
+            return b
+        return a if oa >= ob else b
+
+    ml_map: dict[tuple[Any, ...], dict[str, Any]] = {}
+    spread_map: dict[tuple[Any, ...], dict[str, Any]] = {}
+    total_map: dict[tuple[Any, ...], dict[str, Any]] = {}
+    prop_map: dict[tuple[Any, ...], dict[str, Any]] = {}
+
+    for source in sources:
+        for bl in (source or []):
+            if not isinstance(bl, dict):
+                continue
+            btype = bl.get("type")
+            sport = bl.get("sport", "")
+            game = bl.get("game", "")
+            line = bl.get("line")
+
+            if btype == "moneyline":
+                key = (sport, game, "moneyline")
+                existing = ml_map.get(key)
+                if existing is None:
+                    ml_map[key] = dict(bl)
+                else:
+                    existing["home"] = _best_of(existing.get("home"), bl.get("home"))
+                    existing["away"] = _best_of(existing.get("away"), bl.get("away"))
+                    if not existing.get("home_team") and bl.get("home_team"):
+                        existing["home_team"] = bl.get("home_team")
+                    if not existing.get("away_team") and bl.get("away_team"):
+                        existing["away_team"] = bl.get("away_team")
+
+            elif btype == "spread":
+                side = bl.get("side", "")
+                key = (sport, game, "spread", line, side)
+                existing = spread_map.get(key)
+                if existing is None:
+                    spread_map[key] = dict(bl)
+                else:
+                    existing["pick"] = _best_of(existing.get("pick"), bl.get("pick"))
+
+            elif btype == "total":
+                key = (sport, game, "total", line)
+                existing = total_map.get(key)
+                if existing is None:
+                    total_map[key] = dict(bl)
+                else:
+                    existing["over"] = _best_of(existing.get("over"), bl.get("over"))
+                    existing["under"] = _best_of(existing.get("under"), bl.get("under"))
+
+            elif btype == "prop":
+                player = bl.get("player", "")
+                prop_type = bl.get("prop_type", "")
+                key = (sport, game, "prop", player, prop_type, line)
+                existing = prop_map.get(key)
+                if existing is None:
+                    prop_map[key] = dict(bl)
+                else:
+                    existing["over"] = _best_of(existing.get("over"), bl.get("over"))
+                    existing["under"] = _best_of(existing.get("under"), bl.get("under"))
+
+    return list(ml_map.values()) + list(spread_map.values()) + list(total_map.values()) + list(prop_map.values())
+
+
+def _kalshi_prices_are_plausible(
+    kalshi_home_am: int,
+    kalshi_away_am: int,
+    sportsbook_home_am: int | None,
+    sportsbook_away_am: int | None,
+) -> bool:
+    """
+    Sanity check that Kalshi and sportsbook baseline agree on favorite direction.
+    """
+    if sportsbook_home_am is None or sportsbook_away_am is None:
+        return True
+
+    kalshi_home_is_fav = kalshi_home_am < 0
+    sportsbook_home_is_fav = sportsbook_home_am < 0
+    if kalshi_home_is_fav != sportsbook_home_is_fav:
+        if abs(sportsbook_home_am) > 150:
+            return False
+    return True
+
+
 def _bovada_events_to_raw_lines(bovada_events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     lines: list[dict[str, Any]] = []
     market_kind_map = {"moneyline": "ml", "spread": "spread", "total": "total"}
@@ -1144,6 +1248,14 @@ def _flat_markets_to_nested(flat_markets: list[dict], book_id: int) -> list[dict
     Convert flat Kalshi/Polymarket/Bovada market dicts into the nested
     participants -> lines -> prices shape that build_market_index expects.
     """
+    # Polymarket: exclude any market where prediction_markets could not
+    # resolve a real CLOB ask and we only have a Gamma midpoint placeholder.
+    flat_markets = [
+        m
+        for m in flat_markets
+        if not (isinstance(m, dict) and m.get("_price_is_stale_midprice"))
+    ]
+
     nested: list[dict] = []
     now = datetime.now(timezone.utc).isoformat()
     bid = str(book_id)
@@ -1276,6 +1388,48 @@ def _inject_matching_markets(
             {**m, "selection": flip.get(m.get("selection"), m.get("selection"))}
             for m in best_markets
         ]
+
+    if book_id == KALSHI_BOOK_ID:
+        sb_home_am: int | None = None
+        sb_away_am: int | None = None
+        raw_evt = bucket.get("_enriched_event") or {}
+        for mkt in (raw_evt.get("markets") or []):
+            if mkt.get("market_id") == 1 and mkt.get("period_id") == 0:
+                for idx, p in enumerate(mkt.get("participants") or []):
+                    prices = (p.get("lines") or [{}])[0].get("prices") or {}
+                    for book_id_str, price_obj in prices.items():
+                        try:
+                            src_book_id = int(book_id_str)
+                            book_name = therundown.KNOWN_BOOKS.get(src_book_id, "")
+                            if book_name.lower() in ("betmgm", "draftkings", "fanduel"):
+                                am = int(price_obj.get("price", 0))
+                                if idx == 0:
+                                    sb_away_am = am
+                                else:
+                                    sb_home_am = am
+                        except Exception:
+                            pass
+
+        kalshi_home = next(
+            (m.get("american_odds") for m in best_markets if m.get("market_type") == "moneyline" and m.get("selection") == "home"),
+            None,
+        )
+        kalshi_away = next(
+            (m.get("american_odds") for m in best_markets if m.get("market_type") == "moneyline" and m.get("selection") == "away"),
+            None,
+        )
+        if isinstance(kalshi_home, int) and isinstance(kalshi_away, int):
+            if not _kalshi_prices_are_plausible(kalshi_home, kalshi_away, sb_home_am, sb_away_am):
+                print(
+                    f"  KALSHI_SWAP_DETECTED [{bucket.get('home_team')} vs {bucket.get('away_team')}]: "
+                    f"Kalshi home={kalshi_home} away={kalshi_away} vs sportsbook home={sb_home_am} away={sb_away_am}. "
+                    f"Swapping Kalshi prices."
+                )
+                flip = {"home": "away", "away": "home"}
+                best_markets = [
+                    {**m, "selection": flip.get(m.get("selection"), m.get("selection"))}
+                    for m in best_markets
+                ]
 
     nested_markets = _flat_markets_to_nested(best_markets, book_id)
     enriched = bucket["_enriched_event"]
@@ -1430,6 +1584,11 @@ def _market_dict_to_price_entry(
     if sel not in ("home", "away", "over", "under"):
         return None
 
+    # Polymarket: exclude markets where Gamma mid-price was not replaced by
+    # a resolved CLOB ask (tracked in prediction_markets.update_polymarket_clob_prices).
+    if market.get("_price_is_stale_midprice"):
+        return None
+
     price_am  = market.get("american_odds")
     price_dec = market.get("decimal_odds")
 
@@ -1451,6 +1610,10 @@ def _market_dict_to_price_entry(
         "price_am":   price_am,
         "price_dec":  price_dec,
         "updated_at": updated_at,
+        "_contract_type": market.get("_contract_type"),
+        "_source_book": market.get("_source_book"),
+        "_selection_for_validation": sel,
+        "_price_is_stale_midprice": bool(market.get("_price_is_stale_midprice")),
     }
     return index_key, sel, price_entry
 
@@ -1520,6 +1683,33 @@ _RUNDOWN_BOOKS: frozenset[str] = frozenset({
     "Sportsbetting", "BetOnline", "LowVig",
     "Unibet", "YouWager", "Intertops", "Matchbook",
 })
+
+
+def _contracts_cover_both_outcomes(entry_a: dict, entry_b: dict) -> bool:
+    """
+    Validate that two PM contract entries jointly cover both game outcomes.
+    """
+    type_a = entry_a.get("_contract_type")
+    type_b = entry_b.get("_contract_type")
+    sel_a = entry_a.get("_selection_for_validation")
+    sel_b = entry_b.get("_selection_for_validation")
+
+    # Non-PM or mixed PM/sportsbook pairings remain allowed.
+    if not type_a and not type_b:
+        return True
+    if not type_a or not type_b:
+        return True
+
+    same_selection = (sel_a == sel_b)
+    same_type = (type_a == type_b)
+
+    if same_selection and same_type:
+        return False
+    if same_selection and not same_type:
+        return True
+    if not same_selection and same_type:
+        return True
+    return False
 
 
 def _run_cross_source_arb_for_event(
@@ -1611,6 +1801,18 @@ def _run_cross_source_arb_for_event(
 
         # Skip if both legs are pure Rundown books
         if not _is_external(best_a["book"]) and not _is_external(best_b["book"]):
+            continue
+
+        if kind == "ml" and not _contracts_cover_both_outcomes(best_a, best_b):
+            logger.debug(
+                "Skipping invalid PM pair: %s/%s/%s vs %s/%s/%s",
+                best_a.get("book"),
+                best_a.get("_contract_type"),
+                best_a.get("_selection_for_validation"),
+                best_b.get("book"),
+                best_b.get("_contract_type"),
+                best_b.get("_selection_for_validation"),
+            )
             continue
 
         dec_a  = best_a["price_dec"]
@@ -1743,6 +1945,112 @@ def _run_cross_source_arb_for_event(
     return arbs, raw_lines
 
 
+def _run_live_source_arbs(
+    bovada_events: list[dict[str, Any]],
+    kalshi_events: list[dict[str, Any]],
+    poly_events: list[dict[str, Any]],
+    match_threshold: int = 75,
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """
+    Detect arbs across live sources directly (Bovada/Kalshi/Polymarket),
+    without requiring a TheRundown anchor event.
+    """
+    fetch_ts = datetime.now(timezone.utc).isoformat()
+    all_arbs: list[dict] = []
+    all_lines: list[dict] = []
+    all_best: list[dict] = []
+
+    def _to_matchable(events: list[dict[str, Any]], source_label: str) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for evt in events:
+            home = _norm(evt.get("home_team") or "")
+            away = _norm(evt.get("away_team") or "")
+            sport = str(evt.get("sport") or "").lower()
+            if not home or not away or not sport:
+                continue
+            out.append({
+                "home_norm": home,
+                "away_norm": away,
+                "sport": sport,
+                "home_team": evt.get("home_team", ""),
+                "away_team": evt.get("away_team", ""),
+                "start_time": evt.get("start_time", ""),
+                "markets": evt.get("markets") or [],
+                "_source": source_label,
+            })
+        return out
+
+    all_live = (
+        _to_matchable(bovada_events, "bovada")
+        + _to_matchable(kalshi_events, "kalshi")
+        + _to_matchable(poly_events, "polymarket")
+    )
+
+    used: set[int] = set()
+    clusters: list[list[dict[str, Any]]] = []
+    for i, anchor in enumerate(all_live):
+        if i in used:
+            continue
+        cluster = [anchor]
+        used.add(i)
+        for j, candidate in enumerate(all_live):
+            if j in used:
+                continue
+            if candidate.get("sport") != anchor.get("sport"):
+                continue
+            score_direct = min(
+                _team_match_score(anchor["home_norm"], candidate["home_norm"]),
+                _team_match_score(anchor["away_norm"], candidate["away_norm"]),
+            )
+            score_swapped = min(
+                _team_match_score(anchor["home_norm"], candidate["away_norm"]),
+                _team_match_score(anchor["away_norm"], candidate["home_norm"]),
+            )
+            if max(score_direct, score_swapped) < match_threshold:
+                continue
+
+            candidate_adj = candidate
+            if score_swapped > score_direct:
+                flip = {"home": "away", "away": "home"}
+                candidate_adj = dict(candidate)
+                candidate_adj["home_norm"], candidate_adj["away_norm"] = candidate["away_norm"], candidate["home_norm"]
+                candidate_adj["home_team"], candidate_adj["away_team"] = candidate["away_team"], candidate["home_team"]
+                candidate_adj["markets"] = [
+                    {**m, "selection": flip.get(m.get("selection"), m.get("selection"))}
+                    for m in candidate.get("markets") or []
+                ]
+
+            cluster.append(candidate_adj)
+            used.add(j)
+        if len(cluster) > 1:
+            clusters.append(cluster)
+
+    for cluster in clusters:
+        anchor_evt = cluster[0]
+        books_dict: dict[str, list[dict]] = {"bovada": [], "kalshi": [], "polymarket": []}
+        for member in cluster:
+            src = str(member.get("_source") or "")
+            if src in books_dict:
+                books_dict[src].extend(member.get("markets") or [])
+
+        consolidated = {
+            "sport": anchor_evt.get("sport", ""),
+            "home_team": anchor_evt.get("home_team", ""),
+            "away_team": anchor_evt.get("away_team", ""),
+            "start_time": anchor_evt.get("start_time", ""),
+            "_raw_event": None,
+            "books": books_dict,
+        }
+        sport_label = str(anchor_evt.get("sport") or "").upper()
+        arbs, lines = _run_cross_source_arb_for_event(consolidated, sport_label, fetch_ts)
+        all_arbs.extend(a for a in arbs if a.get("profit", 0) > 0)
+        all_lines.extend(lines)
+
+    all_arbs.sort(key=lambda r: r.get("profit", 0), reverse=True)
+    logger.info("Live-source arbs: %d clusters -> %d arbs", len(clusters), len(all_arbs))
+    return all_arbs, all_lines, all_best
+
+
 def _run_all_cross_source_arbs(
     consolidated_events: list[dict[str, Any]],
 ) -> tuple[list[dict], list[dict]]:
@@ -1798,6 +2106,11 @@ async def handle_scan_now(request: web.Request) -> web.Response:
         state.last_error = None
 
         # ── Step 1: Fetch all 4 sources concurrently ──────────────────
+        sport_keys = [
+            _RUNDOWN_TO_PM_SPORT[name]
+            for name in selected_names
+            if name in _RUNDOWN_TO_PM_SPORT
+        ]
         rundown_task = asyncio.to_thread(scan_arbs_once, selected_ids)
         bovada_task  = asyncio.wait_for(
             _fetch_bovada_events_for_sports(selected_names),
@@ -1805,27 +2118,46 @@ async def handle_scan_now(request: web.Request) -> web.Response:
         )
 
         pm_errors: list[str] = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-            kalshi_future = pool.submit(fetch_kalshi_markets)
-            poly_future   = pool.submit(fetch_polymarket_markets)
+        kalshi_events: list[dict[str, Any]] = []
+        poly_events: list[dict[str, Any]] = []
 
-            rundown_result, bovada_result = await asyncio.gather(
-                rundown_task, bovada_task, return_exceptions=True,
-            )
+        pm_task = asyncio.wait_for(
+            prediction_markets.fetch_all_prediction_markets(sport_keys),
+            timeout=30.0,
+        )
 
-            try:
-                kalshi_events: list[dict[str, Any]] = kalshi_future.result(timeout=12) or []
-            except Exception as e:
-                print(f"KALSHI_WARN: {e}")
-                kalshi_events = []
-                pm_errors.append(f"Kalshi: {e}")
+        rundown_result, bovada_result, pm_result = await asyncio.gather(
+            rundown_task, bovada_task, pm_task, return_exceptions=True,
+        )
 
-            try:
-                poly_events: list[dict[str, Any]] = poly_future.result(timeout=14) or []
-            except Exception as e:
-                print(f"POLYMARKET_WARN: {e}")
-                poly_events = []
-                pm_errors.append(f"Polymarket: {e}")
+        if isinstance(pm_result, Exception):
+            pm_errors.append(f"PredictionMarkets: {pm_result}")
+        else:
+            kalshi_events, poly_events = pm_result
+
+        # Fallback to legacy scrapers if the async pipeline is empty/failed.
+        need_kalshi = not kalshi_events
+        need_poly = not poly_events
+        if (need_kalshi or need_poly) and sport_keys:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                kalshi_future = pool.submit(fetch_kalshi_markets, sport_keys) if need_kalshi else None
+                poly_future   = pool.submit(fetch_polymarket_markets, sport_keys) if need_poly else None
+
+                if kalshi_future is not None:
+                    try:
+                        kalshi_events = kalshi_future.result(timeout=12) or []
+                    except Exception as e:
+                        print(f"KALSHI_WARN: {e}")
+                        kalshi_events = []
+                        pm_errors.append(f"Kalshi legacy: {e}")
+
+                if poly_future is not None:
+                    try:
+                        poly_events = poly_future.result(timeout=14) or []
+                    except Exception as e:
+                        print(f"POLYMARKET_WARN: {e}")
+                        poly_events = []
+                        pm_errors.append(f"Polymarket legacy: {e}")
 
         print(
             f"SOURCES: TheRundown=ok  "
@@ -1834,11 +2166,12 @@ async def handle_scan_now(request: web.Request) -> web.Response:
             f"Polymarket={len(poly_events)} events"
         )
 
-        # ── Step 2: Unpack TheRundown result ──────────────────────────
+        # ── Step 2: Unpack fetched results independently ───────────────
         if isinstance(rundown_result, Exception):
-            raise rundown_result
-
-        rd_arbs, rd_lines, rd_best = rundown_result
+            logger.warning("TheRundown scan failed: %s", rundown_result)
+            rd_arbs, rd_lines, rd_best = [], [], []
+        else:
+            rd_arbs, rd_lines, rd_best = rundown_result
 
         bovada_error: str | None = None
         bovada_events: list[dict[str, Any]] = []
@@ -1850,30 +2183,45 @@ async def handle_scan_now(request: web.Request) -> web.Response:
 
         pm_error: str | None = "; ".join(pm_errors) if pm_errors else None
 
-        # ── Step 3: Build unified game pool + cross-source arb engine ─
-        rundown_events = _normalize_rundown_events_for_matching(selected_ids)
+        # ── Step 3: Live-source-only arbs (no TheRundown dependency) ───
+        live_arbs, live_lines, live_best = _run_live_source_arbs(
+            bovada_events=bovada_events,
+            kalshi_events=kalshi_events,
+            poly_events=poly_events,
+        )
 
+        # ── Step 4: Combined pool with TheRundown as extra book ────────
+        rundown_events = _normalize_rundown_events_for_matching(selected_ids)
         game_pool = _build_unified_game_pool(
             rundown_events=rundown_events,
             bovada_events=bovada_events,
             kalshi_events=kalshi_events,
             poly_events=poly_events,
         )
-
         cross_arbs, cross_lines, cross_best = _run_arbs_on_pool(game_pool)
 
-        # ── Step 4: Merge, dedup, store ───────────────────────────────
+        # Tag source provenance for UI display.
+        for arb in rd_arbs:
+            arb["arb_source"] = "rundown"
+        for arb in live_arbs:
+            arb["arb_source"] = "live"
+        for arb in cross_arbs:
+            arb["arb_source"] = "combined"
+
+        # ── Step 5: Merge, dedup, store ───────────────────────────────
         bovada_best_lines = _bovada_events_to_best_lines(bovada_events)
 
-        state.arbs       = _dedup_arbs(rd_arbs + cross_arbs)
-        state.lines      = rd_lines + cross_lines
-        state.best_lines = rd_best + bovada_best_lines + cross_best
+        state.arbs       = _dedup_arbs(rd_arbs + live_arbs + cross_arbs)
+        state.arbs.sort(key=lambda r: r.get("profit", 0), reverse=True)
+        state.lines      = rd_lines + live_lines + cross_lines
+        state.best_lines = _merge_best_lines([rd_best, bovada_best_lines, live_best, cross_best])
         state.last_scan_ms     = _now_ms()
         state.last_scan_sports = selected_names
 
         print(
-            f"  SCAN COMPLETE: {len(rd_arbs)} intra-Rundown arbs + "
-            f"{len(cross_arbs)} cross-source arbs → "
+            f"  SCAN COMPLETE: {len(rd_arbs)} rundown arbs + "
+            f"{len(live_arbs)} live-source arbs + "
+            f"{len(cross_arbs)} combined arbs → "
             f"{len(state.arbs)} total (deduped) | "
             f"Kalshi:{len(kalshi_events)} Poly:{len(poly_events)} "
             f"Bovada:{len(bovada_events)} events"
