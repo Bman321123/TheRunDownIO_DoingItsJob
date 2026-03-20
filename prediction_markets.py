@@ -1297,9 +1297,27 @@ def _parse_polymarket_event(raw: dict, sport: str, fetch_ts: str) -> dict | None
 
     if mtype == "moneyline":
         # outcome_a / outcome_b = team names
+        # Some Polymarket moneyline markets can return generic outcome labels
+        # like "Away"/"Home". Recover team names from the question/title.
+        if outcome_a.lower() in ("home", "away") or outcome_b.lower() in ("home", "away"):
+            parsed = None
+            try:
+                parts = re.split(r"\s+vs\.?\s+", str(question or raw.get("title") or "").strip(), flags=re.IGNORECASE)
+                parts = [p.strip() for p in parts if p.strip()]
+                if len(parts) >= 2:
+                    parsed = (parts[0], parts[1])
+            except Exception:
+                parsed = None
+            if parsed:
+                outcome_a, outcome_b = parsed
+
         dec_a = pm_price_to_decimal(price_a, fee_rate=POLYMARKET_FEE_RATE) if price_a > 0 else 0
         dec_b = pm_price_to_decimal(price_b, fee_rate=POLYMARKET_FEE_RATE) if price_b > 0 else 0
         if dec_a <= 1.0 or dec_b <= 1.0:
+            return None
+
+        # Still generic after parsing -> skip the event to avoid polluting merges.
+        if outcome_a.lower() in ("home", "away") or outcome_b.lower() in ("home", "away"):
             return None
 
         return {
@@ -1570,8 +1588,10 @@ async def _fetch_clob_executable_ask(
             if not isinstance(asks, list) or not asks:
                 return None
 
-            cum_notional = 0.0
-            worst_ask = None
+            # Polymarket returns asks in an arbitrary order; "best" isn't guaranteed
+            # to be the first element. For an executable BUY we should walk asks
+            # from lowest price upward until we can fill CLOB_MIN_SIZE notional.
+            levels: list[tuple[float, float]] = []
             for level in asks:
                 if not isinstance(level, dict):
                     continue
@@ -1579,7 +1599,16 @@ async def _fetch_clob_executable_ask(
                 size = _safe_float(level.get("size"))
                 if price is None or size is None or not (0 < price < 1) or size <= 0:
                     continue
+                levels.append((price, size))
 
+            if not levels:
+                return None
+
+            levels.sort(key=lambda ps: ps[0])  # cheapest ask first
+
+            cum_notional = 0.0
+            worst_ask: float | None = None
+            for price, size in levels:
                 cum_notional += price * size
                 worst_ask = price
                 if cum_notional >= CLOB_MIN_SIZE:

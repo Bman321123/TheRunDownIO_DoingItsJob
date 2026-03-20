@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { UnderlineTabs } from "@/components/ui/underline-tabs";
 import { AnimatedTextReveal } from "@/components/ui/animated-text-reveal";
+import { Badge } from "@/components/ui/badge";
 
 const DEFAULT_BASE = "http://127.0.0.1:3030";
 
@@ -375,6 +376,30 @@ export default function HomePage() {
                   : v > 0
                     ? "font-bold tabular-nums text-[#34D399]"
                     : "font-bold tabular-nums text-[#F87171]";
+
+              const amToDec = (am: number) =>
+                am >= 100 ? am / 100 + 1 : am <= -100 ? 100 / Math.abs(am) + 1 : 0;
+
+              const pairValue = (oddsA: number, oddsB: number) => {
+                const decA = amToDec(oddsA);
+                const decB = amToDec(oddsB);
+                if (decA <= 1 || decB <= 1) return null;
+                return Math.round((1 - (1 / decA + 1 / decB)) * 10000) / 100;
+              };
+
+              const valueBadge = (val: number | null) => {
+                if (val == null) return null;
+                const positive = val >= 0;
+                return (
+                  <Badge
+                    variant={positive ? "success" : "danger"}
+                    className="font-mono text-[11px] font-bold"
+                  >
+                    {positive ? "+" : ""}
+                    {val.toFixed(1)}%
+                  </Badge>
+                );
+              };
               const homeName = ml[0]?.home_team ?? spreads.find((s) => s.side === "home")?.team ?? "Home";
               const awayName = ml[0]?.away_team ?? spreads.find((s) => s.side === "away")?.team ?? "Away";
 
@@ -406,6 +431,7 @@ export default function HomePage() {
                     {ml.length > 0 && ml.map((bl, idx) => {
                       if (!bl.home || !bl.away || !bl.home_team || !bl.away_team) return null;
                       if (bl.home.odds_am == null || bl.away.odds_am == null) return null;
+                      const mlVal = pairValue(bl.home.odds_am, bl.away.odds_am);
                       return (
                         <div key={`ml-${idx}`} className="mt-3">
                           <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
@@ -438,6 +464,11 @@ export default function HomePage() {
                               </div>
                             </div>
                           </div>
+                          {!spreadsOpen && !totalsOpen && mlVal != null && (
+                            <div className="mt-1.5 flex items-center gap-2 text-[10px] text-muted-text">
+                              <span>Both-sides value:</span> {valueBadge(mlVal)}
+                            </div>
+                          )}
                         </div>
                       );
                     })}
@@ -509,6 +540,11 @@ export default function HomePage() {
                         const pairA = homeNeg && awayPos;
                         const pairB = homePos && awayNeg;
                         if (!pairA && !pairB) return null;
+
+                        const valA = pairA ? pairValue(homeNeg!.pick!.odds_am, awayPos!.pick!.odds_am) : null;
+                        const valB = pairB ? pairValue(homePos!.pick!.odds_am, awayNeg!.pick!.odds_am) : null;
+                        const showA = valA != null && (valB == null || valA >= valB);
+                        const showB = valB != null && (valA == null || valB > valA);
                         return (
                           <div key={`sp-${absLine}`} className="space-y-1.5">
                               <div className="text-[10px] uppercase tracking-wider text-secondary font-semibold">
@@ -551,6 +587,11 @@ export default function HomePage() {
                                     </div>
                                   </div>
                                 </div>
+                                {showA && valA != null && (
+                                  <div className="mt-1 flex items-center gap-1.5 pl-1 text-[10px] text-muted-text">
+                                    Value: {valueBadge(valA)}
+                                  </div>
+                                )}
                               </div>
                             )}
 
@@ -590,6 +631,11 @@ export default function HomePage() {
                                     </div>
                                   </div>
                                 </div>
+                                {showB && valB != null && (
+                                  <div className="mt-1 flex items-center gap-1.5 pl-1 text-[10px] text-muted-text">
+                                    Value: {valueBadge(valB)}
+                                  </div>
+                                )}
                               </div>
                             )}
 
@@ -607,6 +653,7 @@ export default function HomePage() {
                         .sort((a, b) => (a.line ?? 0) - (b.line ?? 0))
                         .map((bl, idx) => {
                           if (!bl.over?.book || !bl.under?.book) return null;
+                          const tVal = pairValue(bl.over.odds_am, bl.under.odds_am);
                           return (
                             <div
                               key={`total-${bl.line}-${idx}`}
@@ -616,6 +663,7 @@ export default function HomePage() {
                                 {bl.line != null ? `Total ${bl.line}` : "Total"}
                               </span>
                               <div className="flex items-center gap-3 text-xs">
+                                {tVal != null && valueBadge(tVal)}
                                 <div className="flex items-center gap-1.5">
                                   <span className="text-[10px] text-secondary">O</span>
                                   <span className={`font-mono ${oddsColor(bl.over.odds_am)}`}>

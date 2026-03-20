@@ -1001,10 +1001,12 @@ def _best_american_option(options: list[dict[str, Any]]) -> dict[str, Any] | Non
 
 def _merge_best_lines(sources: list[list[dict[str, Any]]]) -> list[dict[str, Any]]:
     """
-    Merge multiple best_lines lists into one entry per market key.
+    Merge multiple best_lines lists into one entry per market.
 
-    For each unique game+market combination, keep the single best odds per side
-    across all sources using American odds shopping rules.
+    Important: the frontend groups cards by `sport::game`. Bovada frequently emits
+    different-but-equivalent team naming (e.g. `Miami` vs `Miami Heat`), so we
+    dedupe using normalized home/away identities and then overwrite the merged
+    entry's `game`/team display fields with a canonical representation.
     """
 
     def _best_of(a: dict[str, Any] | None, b: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -1014,15 +1016,103 @@ def _merge_best_lines(sources: list[list[dict[str, Any]]]) -> list[dict[str, Any
             return a
         oa = a.get("odds_am")
         ob = b.get("odds_am")
-        if not isinstance(oa, int):
+        if not isinstance(oa, (int, float)):
             return b
-        if not isinstance(ob, int):
+        if not isinstance(ob, (int, float)):
             return a
+        # Positive odds always beat negatives. Among negatives, closer to zero wins.
         if oa > 0 and ob <= 0:
             return a
         if ob > 0 and oa <= 0:
             return b
         return a if oa >= ob else b
+
+    def _parse_game_away_home(game: str) -> tuple[str, str]:
+        """Parse "Away @ Home" into (away, home)."""
+        if not game:
+            return "", ""
+        m = re.match(r"^\s*(.*?)\s*@\s*(.*?)\s*$", str(game))
+        if not m:
+            return "", ""
+        away_raw = (m.group(1) or "").strip()
+        home_raw = (m.group(2) or "").strip()
+        return away_raw, home_raw
+
+    def _display_from_norm(norm: str) -> str:
+        norm = (norm or "").strip()
+        if not norm:
+            return ""
+        return " ".join(w[:1].upper() + w[1:] if w else w for w in norm.split(" "))
+
+    def _norm_and_display(team: str) -> tuple[str, str]:
+        norm = _normalize_team_name(team)
+        return norm, _display_from_norm(norm)
+
+    # Canonicalize matchups across naming variants (e.g. "New York" vs "New York Knicks")
+    # by fuzzy-matching home+away teams to an existing canonical pair.
+    canonical_pairs: list[dict[str, Any]] = []
+
+    def _maybe_contextualize_la(team_raw: str, other_raw: str, sport: str) -> tuple[str, str]:
+        """
+        Contextual LA mapping:
+        - If the other side is Lakers/Clippers, interpret "Los Angeles"/"LA" as the opposite.
+        """
+        norm = _normalize_team_name(team_raw)
+        other_norm = _normalize_team_name(other_raw)
+        sport_u = str(sport or "").upper()
+        if sport_u == "NBA":
+            low_norm = (norm or "").lower()
+            # Only trigger for city-only LA labels, not when lakers/clippers are already present.
+            if low_norm in {"los angeles", "la"} and "lakers" not in low_norm and "clippers" not in low_norm:
+                if "clippers" in other_norm:
+                    norm = "los angeles lakers"
+                elif "lakers" in other_norm:
+                    norm = "los angeles clippers"
+        return norm, _display_from_norm(norm)
+
+    def _canonical_game_for_pair(
+        sport: str,
+        away_raw: str,
+        home_raw: str,
+    ) -> tuple[str, str, str, str, str]:
+        """
+        Return (away_norm, home_norm, away_disp, home_disp, canonical_game)
+        where canonical_* is chosen by fuzzy-matching to previously seen pairs.
+        """
+        away_norm, away_disp = _norm_and_display(away_raw)
+        home_norm, home_disp = _norm_and_display(home_raw)
+
+        # Optional contextual mapping for ambiguous LA city labels.
+        away_norm, away_disp = _maybe_contextualize_la(away_raw, home_raw, sport)
+        home_norm, home_disp = _maybe_contextualize_la(home_raw, away_raw, sport)
+
+        sport_str = str(sport or "")
+        for cp in canonical_pairs:
+            if cp.get("sport") != sport_str:
+                continue
+            if (
+                _team_match_score(away_raw, cp.get("away_disp", "")) >= _FUZZY_MATCH_THRESHOLD
+                and _team_match_score(home_raw, cp.get("home_disp", "")) >= _FUZZY_MATCH_THRESHOLD
+            ):
+                canonical_game = cp.get("game") or ""
+                return (
+                    cp.get("away_norm", ""),
+                    cp.get("home_norm", ""),
+                    cp.get("away_disp", ""),
+                    cp.get("home_disp", ""),
+                    canonical_game,
+                )
+
+        canonical_game = f"{away_disp} @ {home_disp}"
+        canonical_pairs.append({
+            "sport": sport_str,
+            "away_norm": away_norm,
+            "home_norm": home_norm,
+            "away_disp": away_disp,
+            "home_disp": home_disp,
+            "game": canonical_game,
+        })
+        return away_norm, home_norm, away_disp, home_disp, canonical_game
 
     ml_map: dict[tuple[Any, ...], dict[str, Any]] = {}
     spread_map: dict[tuple[Any, ...], dict[str, Any]] = {}
@@ -1033,52 +1123,88 @@ def _merge_best_lines(sources: list[list[dict[str, Any]]]) -> list[dict[str, Any
         for bl in (source or []):
             if not isinstance(bl, dict):
                 continue
+
             btype = bl.get("type")
             sport = bl.get("sport", "")
-            game = bl.get("game", "")
             line = bl.get("line")
+            game_raw = bl.get("game", "") or ""
+
+            away_norm = home_norm = ""
+            away_disp = home_disp = ""
+            canonical_game = ""
 
             if btype == "moneyline":
-                key = (sport, game, "moneyline")
+                away_raw = bl.get("away_team", "") or ""
+                home_raw = bl.get("home_team", "") or ""
+                away_norm, home_norm, away_disp, home_disp, canonical_game = _canonical_game_for_pair(
+                    sport, away_raw, home_raw
+                )
+                if not away_norm or not home_norm:
+                    continue
+                key = (sport, away_norm, home_norm, "moneyline")
                 existing = ml_map.get(key)
                 if existing is None:
-                    ml_map[key] = dict(bl)
+                    merged = dict(bl)
+                    merged["game"] = canonical_game
+                    merged["home_team"] = home_disp
+                    merged["away_team"] = away_disp
+                    merged["home"] = dict(bl.get("home") or {})
+                    merged["away"] = dict(bl.get("away") or {})
+                    ml_map[key] = merged
                 else:
                     existing["home"] = _best_of(existing.get("home"), bl.get("home"))
                     existing["away"] = _best_of(existing.get("away"), bl.get("away"))
-                    if not existing.get("home_team") and bl.get("home_team"):
-                        existing["home_team"] = bl.get("home_team")
-                    if not existing.get("away_team") and bl.get("away_team"):
-                        existing["away_team"] = bl.get("away_team")
+                    existing["home_team"] = home_disp
+                    existing["away_team"] = away_disp
+                    existing["game"] = canonical_game
 
-            elif btype == "spread":
-                side = bl.get("side", "")
-                key = (sport, game, "spread", line, side)
-                existing = spread_map.get(key)
-                if existing is None:
-                    spread_map[key] = dict(bl)
-                else:
-                    existing["pick"] = _best_of(existing.get("pick"), bl.get("pick"))
+            elif btype in {"spread", "total", "prop"}:
+                away_raw, home_raw = _parse_game_away_home(game_raw)
+                away_norm, home_norm, away_disp, home_disp, canonical_game = _canonical_game_for_pair(
+                    sport, away_raw, home_raw
+                )
+                if not away_norm or not home_norm:
+                    continue
 
-            elif btype == "total":
-                key = (sport, game, "total", line)
-                existing = total_map.get(key)
-                if existing is None:
-                    total_map[key] = dict(bl)
-                else:
-                    existing["over"] = _best_of(existing.get("over"), bl.get("over"))
-                    existing["under"] = _best_of(existing.get("under"), bl.get("under"))
+                if btype == "spread":
+                    side = bl.get("side", "")
+                    key = (sport, away_norm, home_norm, "spread", line, side)
+                    existing = spread_map.get(key)
+                    if existing is None:
+                        merged = dict(bl)
+                        merged["game"] = canonical_game
+                        merged["team"] = home_disp if side == "home" else away_disp
+                        spread_map[key] = merged
+                    else:
+                        existing["pick"] = _best_of(existing.get("pick"), bl.get("pick"))
+                        existing["game"] = canonical_game
+                        existing["team"] = home_disp if side == "home" else away_disp
 
-            elif btype == "prop":
-                player = bl.get("player", "")
-                prop_type = bl.get("prop_type", "")
-                key = (sport, game, "prop", player, prop_type, line)
-                existing = prop_map.get(key)
-                if existing is None:
-                    prop_map[key] = dict(bl)
-                else:
-                    existing["over"] = _best_of(existing.get("over"), bl.get("over"))
-                    existing["under"] = _best_of(existing.get("under"), bl.get("under"))
+                elif btype == "total":
+                    key = (sport, away_norm, home_norm, "total", line)
+                    existing = total_map.get(key)
+                    if existing is None:
+                        merged = dict(bl)
+                        merged["game"] = canonical_game
+                        total_map[key] = merged
+                    else:
+                        existing["over"] = _best_of(existing.get("over"), bl.get("over"))
+                        existing["under"] = _best_of(existing.get("under"), bl.get("under"))
+                        existing["game"] = canonical_game
+
+                else:  # prop
+                    player = bl.get("player", "")
+                    prop_type = bl.get("prop_type", "")
+                    key = (sport, away_norm, home_norm, "prop", player, prop_type, line)
+                    existing = prop_map.get(key)
+                    if existing is None:
+                        merged = dict(bl)
+                        merged["game"] = canonical_game
+                        prop_map[key] = merged
+                    else:
+                        existing["over"] = _best_of(existing.get("over"), bl.get("over"))
+                        existing["under"] = _best_of(existing.get("under"), bl.get("under"))
+                        existing["game"] = canonical_game
 
     return list(ml_map.values()) + list(spread_map.values()) + list(total_map.values()) + list(prop_map.values())
 
@@ -1724,12 +1850,21 @@ def _run_cross_source_arb_for_event(
     Only arbs where at least one leg is from Bovada/Kalshi/Polymarket are returned
     (to avoid duplicating intra-Rundown arbs from scan_arbs_once).
     """
-    try:
-        game, home_name, away_name = therundown._resolve_teams(consolidated.get("_raw_event") or {})
-    except Exception:
-        home_name = consolidated.get("home_team", "?")
-        away_name = consolidated.get("away_team", "?")
+    raw_anchor = consolidated.get("_raw_event")
+    if not raw_anchor:
+        # Live-source-only buckets don't carry a full TheRundown event object.
+        # Use the bucket's known home/away teams so we don't render placeholder
+        # labels like "Away @ Home".
+        home_name = consolidated.get("home_team", "Home")
+        away_name = consolidated.get("away_team", "Away")
         game = f"{away_name} @ {home_name}"
+    else:
+        try:
+            game, home_name, away_name = therundown._resolve_teams(raw_anchor)
+        except Exception:
+            home_name = consolidated.get("home_team", "?")
+            away_name = consolidated.get("away_team", "?")
+            game = f"{away_name} @ {home_name}"
 
     per_line, spread_pairs = _build_cross_source_per_line_index(consolidated, fetch_ts)
     if not per_line:

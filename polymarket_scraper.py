@@ -149,8 +149,29 @@ def _find_moneyline_market(group: dict, sub_markets: list[dict]) -> dict[str, An
             continue
 
         away_team, home_team = _parse_teams_from_title(group_title)
-        if not away_team or not home_team:
-            away_team, home_team = o1, o2
+
+        def _looks_generic_team_label(team: str) -> bool:
+            return str(team or "").strip().lower() in ("home", "away")
+
+        # If outcomes/questions devolve into generic "Away"/"Home" labels, recover
+        # the real teams from the group title (it should contain the actual matchup).
+        if (
+            not away_team
+            or not home_team
+            or _looks_generic_team_label(away_team)
+            or _looks_generic_team_label(home_team)
+        ):
+            parsed = _parse_teams_from_title(group_title)
+            if parsed and parsed[0] and parsed[1] and not (
+                _looks_generic_team_label(parsed[0]) or _looks_generic_team_label(parsed[1])
+            ):
+                away_team, home_team = parsed
+            else:
+                away_team, home_team = o1, o2
+
+        # If we still couldn't resolve real team labels, skip the event.
+        if _looks_generic_team_label(away_team) or _looks_generic_team_label(home_team):
+            return None
 
         now = datetime.datetime.now(datetime.timezone.utc).isoformat()
         return {
