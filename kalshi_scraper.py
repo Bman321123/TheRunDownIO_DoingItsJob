@@ -33,10 +33,37 @@ _SPORT_TO_SERIES: dict[str, list[str]] = {
 
 ALL_SPORT_KEYS = list(_SPORT_TO_SERIES.keys())
 
+# Series ticker → URL slug for deep links
+# e.g. KXNHLGAME → "nhl-game", KXUFCFIGHT → "ufc-fight"
+_SERIES_SLUG_MAP: dict[str, str] = {
+    "KXNHLGAME":     "nhl-game",
+    "KXNBAGAME":     "nba-game",
+    "KXNFLGAME":     "nfl-game",
+    "KXMLBGAME":     "mlb-game",
+    "KXNCAAMBGAME":  "ncaamb-game",
+    "KXNCAAWBGAME":  "ncaawb-game",
+    "KXUFCFIGHT":    "ufc-fight",
+    "KXNCAAFGAME":   "ncaaf-game",
+}
 
-def _dollars_to_american(price: float) -> int | None:
+
+def _series_to_slug(series_ticker: str) -> str:
+    """Convert a Kalshi series ticker to the URL slug used in /markets/ paths."""
+    slug = _SERIES_SLUG_MAP.get(series_ticker.upper())
+    if slug:
+        return slug
+    # Fallback: strip "KX" prefix, split camelCase, lowercase, join with "-"
+    base = series_ticker.upper().removeprefix("KX").lower()
+    # Insert hyphen before the last known suffix
+    for suffix in ("game", "fight"):
+        if base.endswith(suffix):
+            return f"{base[:-len(suffix)]}-{suffix}"
+    return base
+
+
+def _dollars_to_odds(price: float) -> tuple[int, float] | None:
     """
-    Kalshi yes_ask_dollars (0.00–1.00 USD) -> American odds integer after fees.
+    Kalshi yes_ask_dollars (0.00–1.00 USD) -> (american_odds, decimal_odds) after fees.
 
     Fee is applied to PROFIT (net payout), not settlement value:
         net_payout   = 1 - fee_rate × (1 - price)
@@ -51,8 +78,10 @@ def _dollars_to_american(price: float) -> int | None:
         return None
 
     if dec >= 2.0:
-        return round((dec - 1) * 100)
-    return round(-100 / (dec - 1))
+        am = round((dec - 1) * 100)
+    else:
+        am = round(-100 / (dec - 1))
+    return am, round(dec, 6)
 
 
 def _parse_teams_from_title(title: str) -> tuple[str, str] | None:
@@ -118,32 +147,11 @@ def _resolve_executable_yes_ask(
     otherwise walks the orderbook depth.
     """
     ask_dollars = _safe_float(market.get("yes_ask_dollars"))
-    ask_size_fp = _safe_float(market.get("yes_ask_size_fp"))
+
+    # Use the displayed ask price when available — it's the best top-of-book quote.
+    # The orderbook depth walk often returns worse (deeper) prices that are misleading.
     if ask_dollars is not None:
-        top_notional = ask_dollars * ask_size_fp if ask_size_fp is not None else 0.0
-        if top_notional >= min_notional:
-            return ask_dollars
-
-        ticker = str(market.get("ticker") or "")
-        if not ticker:
-            return None
-        if ticker in orderbook_cache:
-            return orderbook_cache[ticker]
-
-        try:
-            resp = requests.get(
-                f"{KALSHI_BASE}/trade-api/v2/markets/{ticker}/orderbook",
-                timeout=TIMEOUT_S,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            orderbook_fp = data.get("orderbook_fp") or {}
-            ask_from_book = _walk_yes_ask_from_orderbook(orderbook_fp, min_notional=min_notional)
-            orderbook_cache[ticker] = ask_from_book
-            return ask_from_book
-        except Exception:
-            orderbook_cache[ticker] = None
-            return None
+        return ask_dollars
 
     # Last-resort fallback if *_dollars is absent.
     return _safe_float(market.get("yes_ask"))
@@ -237,8 +245,8 @@ def _parse_event(raw: dict, orderbook_cache: dict[str, float | None]) -> dict[st
 
     sub_a = active[0]
     sub_b = active[1]
-    name_a = (sub_a.get("yes_sub_title") or sub_a.get("subtitle") or "").strip()
-    name_b = (sub_b.get("yes_sub_title") or sub_b.get("subtitle") or "").strip()
+    name_a = _extract_team_from_sub_title(sub_a)
+    name_b = _extract_team_from_sub_title(sub_b)
 
     price_a = _resolve_executable_yes_ask(sub_a, orderbook_cache, min_notional=CLOB_MIN_SIZE)
     price_b = _resolve_executable_yes_ask(sub_b, orderbook_cache, min_notional=CLOB_MIN_SIZE)
@@ -246,13 +254,24 @@ def _parse_event(raw: dict, orderbook_cache: dict[str, float | None]) -> dict[st
     if price_a is None or price_b is None:
         return None
 
-    am_a = _dollars_to_american(price_a)
-    am_b = _dollars_to_american(price_b)
-    if am_a is None or am_b is None:
+    # Reject events where both sides' ask prices are too low (thin books / phantom arbs)
+    if price_a + price_b < 0.85:
+        print(f"KALSHI_SKIP: thin books — price_a={price_a:.3f} + price_b={price_b:.3f} = "
+              f"{price_a + price_b:.3f} < 0.85 for {title!r}")
         return None
 
-    home_price: int
-    away_price: int
+    odds_a = _dollars_to_odds(price_a)
+    odds_b = _dollars_to_odds(price_b)
+    if odds_a is None or odds_b is None:
+        return None
+
+    am_a, dec_a = odds_a
+    am_b, dec_b = odds_b
+
+    home_am: int
+    away_am: int
+    home_dec: float
+    away_dec: float
     home_team: str
     away_team: str
 
@@ -260,41 +279,70 @@ def _parse_event(raw: dict, orderbook_cache: dict[str, float | None]) -> dict[st
         away_raw, home_raw = parsed
         if _name_matches(name_a, home_raw):
             home_team, away_team = name_a or home_raw, name_b or away_raw
-            home_price, away_price = am_a, am_b
+            home_am, away_am = am_a, am_b
+            home_dec, away_dec = dec_a, dec_b
         elif _name_matches(name_b, home_raw):
             home_team, away_team = name_b or home_raw, name_a or away_raw
-            home_price, away_price = am_b, am_a
+            home_am, away_am = am_b, am_a
+            home_dec, away_dec = dec_b, dec_a
         elif _name_matches(name_a, away_raw):
             home_team, away_team = name_b or home_raw, name_a or away_raw
-            home_price, away_price = am_b, am_a
+            home_am, away_am = am_b, am_a
+            home_dec, away_dec = dec_b, dec_a
         elif _name_matches(name_b, away_raw):
             home_team, away_team = name_a or home_raw, name_b or away_raw
-            home_price, away_price = am_a, am_b
+            home_am, away_am = am_a, am_b
+            home_dec, away_dec = dec_a, dec_b
         else:
-            home_team, away_team = home_raw, away_raw
-            home_price, away_price = am_b, am_a
+            # Also try matching sub-market tickers against title team names
+            ticker_a = (sub_a.get("ticker") or "").lower()
+            ticker_b = (sub_b.get("ticker") or "").lower()
+            home_low = home_raw.lower().replace(" ", "")
+
+            if any(tok in ticker_a for tok in home_low.split() if len(tok) > 2) or home_low in ticker_a:
+                home_team, away_team = name_a or home_raw, name_b or away_raw
+                home_am, away_am = am_a, am_b
+                home_dec, away_dec = dec_a, dec_b
+            elif any(tok in ticker_b for tok in home_low.split() if len(tok) > 2) or home_low in ticker_b:
+                home_team, away_team = name_b or home_raw, name_a or away_raw
+                home_am, away_am = am_b, am_a
+                home_dec, away_dec = dec_b, dec_a
+            else:
+                # Cannot reliably determine home/away — skip rather than guess
+                print(f"KALSHI_SKIP: cannot match sub-markets to teams. title={title!r}, "
+                      f"name_a={name_a!r}, name_b={name_b!r}, "
+                      f"ticker_a={ticker_a!r}, ticker_b={ticker_b!r}")
+                return None
     else:
-        # "vs" titles are ambiguous on home/away ordering.
-        if not name_a or not name_b:
-            return None
-        if name_a.lower() <= name_b.lower():
-            home_team, away_team = name_a, name_b
-            home_price, away_price = am_a, am_b
-        else:
-            home_team, away_team = name_b, name_a
-            home_price, away_price = am_b, am_a
+        # "vs" titles are ambiguous on home/away ordering.  Kalshi almost always
+        # uses "Away at Home" format which is handled above.  If we reach here
+        # the title used "vs" and we cannot reliably determine home/away, so
+        # skip this event rather than guess (alphabetical sort has no correlation
+        # with actual home/away).
+        return None
+
+    # Build direct event URL: https://kalshi.com/markets/{series}/{slug}/{event}
+    event_ticker = raw.get("event_ticker") or ""
+    series_ticker = raw.get("series_ticker") or ""
+    if event_ticker and series_ticker:
+        slug = _series_to_slug(series_ticker)
+        event_url = f"https://kalshi.com/markets/{series_ticker.lower()}/{slug}/{event_ticker.lower()}"
+    else:
+        event_url = "https://kalshi.com/browse/sports"
 
     now = datetime.datetime.now(datetime.timezone.utc).isoformat()
     return {
         "home_team": home_team,
         "away_team": away_team,
         "source": "kalshi",
+        "event_url": event_url,
         "markets": [
             {
                 "market_type": "moneyline",
                 "selection": "home",
                 "affiliate_name": "Kalshi",
-                "american_odds": home_price,
+                "american_odds": home_am,
+                "decimal_odds": home_dec,
                 "line_value": None,
                 "updated_at": now,
             },
@@ -302,7 +350,8 @@ def _parse_event(raw: dict, orderbook_cache: dict[str, float | None]) -> dict[st
                 "market_type": "moneyline",
                 "selection": "away",
                 "affiliate_name": "Kalshi",
-                "american_odds": away_price,
+                "american_odds": away_am,
+                "decimal_odds": away_dec,
                 "line_value": None,
                 "updated_at": now,
             },
@@ -320,10 +369,79 @@ def _safe_float(val: Any) -> float | None:
         return None
 
 
+def _extract_team_from_sub_title(sub_market: dict) -> str:
+    """
+    Extract a team name from a sub-market using all available fields:
+    yes_sub_title, subtitle, and the market's own title (e.g. "Will UConn win?").
+    """
+    for field in ("yes_sub_title", "subtitle"):
+        val = (sub_market.get(field) or "").strip()
+        if val:
+            return val
+
+    # Try extracting from the market title, e.g. "Will UConn win?"
+    mtitle = (sub_market.get("title") or "").strip()
+    m = re.match(r"(?:will\s+)?(.+?)\s+win\b", mtitle, re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+
+    return mtitle
+
+
+# Map common Kalshi abbreviations / alternate names to title-form names.
+# Kalshi yes_sub_title often uses "OTT Senators" while the event title says "Ottawa".
+_KALSHI_ALIAS: dict[str, list[str]] = {
+    # NHL
+    "ott": ["ottawa"], "nyr": ["new york r", "rangers"], "nyi": ["new york i", "islanders"],
+    "la kings": ["los angeles"], "lak": ["los angeles"], "uta mammoth": ["utah"],
+    "tor": ["toronto"], "mtl": ["montreal"], "van": ["vancouver"],
+    "wpg": ["winnipeg"], "cgy": ["calgary"], "edm": ["edmonton"],
+    "det": ["detroit"], "chi": ["chicago"], "stl": ["st. louis", "st louis"],
+    "nsh": ["nashville"], "dal": ["dallas"], "col": ["colorado"],
+    "min": ["minnesota"], "fla": ["florida"], "tbl": ["tampa bay", "tampa"],
+    "car": ["carolina"], "cbj": ["columbus"], "pit": ["pittsburgh"],
+    "phi": ["philadelphia"], "buf": ["buffalo"], "bos": ["boston"],
+    "wsh": ["washington"], "nj": ["new jersey"], "sea": ["seattle"],
+    "sj": ["san jose"], "ana": ["anaheim"],
+    # NBA short forms
+    "phx": ["phoenix"], "mil": ["milwaukee"], "gsw": ["golden state"],
+    "lac": ["la clippers", "los angeles c"], "lal": ["la lakers", "los angeles l"],
+    "okc": ["oklahoma"], "por": ["portland"], "sac": ["sacramento"],
+    "cha": ["charlotte"], "ind": ["indiana"], "atl": ["atlanta"],
+    "mem": ["memphis"], "hou": ["houston"], "den": ["denver"],
+    "sas": ["san antonio"], "orl": ["orlando"], "bkn": ["brooklyn"],
+    "nop": ["new orleans"],
+    # MLB
+    "az": ["arizona"], "lad": ["los angeles d", "dodgers"], "sf": ["san francisco"],
+    "sd": ["san diego"], "cle": ["cleveland"], "nyy": ["new york y", "yankees"],
+    "nym": ["new york m", "mets"], "cws": ["chicago w", "white sox"],
+    "chc": ["chicago c", "cubs"], "kc": ["kansas city"],
+    "tb": ["tampa bay"], "bal": ["baltimore"], "tex": ["texas"],
+    "cin": ["cincinnati"], "oak": ["oakland"],
+}
+
+
 def _name_matches(subtitle: str, team_raw: str) -> bool:
-    """Check if a sub-market label matches a team name (case-insensitive substring)."""
+    """Check if a sub-market label matches a team name (case-insensitive, alias-aware)."""
     a = subtitle.lower().strip()
     b = team_raw.lower().strip()
     if not a or not b:
         return False
-    return a in b or b in a
+    # Direct substring match
+    if a in b or b in a:
+        return True
+    # Word overlap (for multi-word names)
+    a_words = set(a.split())
+    b_words = set(b.split())
+    overlap = {w for w in (a_words & b_words) if len(w) > 2}
+    if overlap:
+        return True
+    # Check alias table: does any token in `a` have an alias that matches `b`?
+    for token in a.split():
+        aliases = _KALSHI_ALIAS.get(token, [])
+        # Also check full `a` string as key (e.g., "la kings")
+        aliases = aliases or _KALSHI_ALIAS.get(a, [])
+        for alias in aliases:
+            if alias in b or b in alias:
+                return True
+    return False

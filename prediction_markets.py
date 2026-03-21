@@ -129,6 +129,37 @@ _SPORT_TO_POLY_SERIES: dict[str, list[str]] = {
     "ncaaf":  ["10210"],
 }
 
+# Kalshi series ticker → URL slug for deep links
+# e.g. KXNHLGAME → "nhl-game", KXUFCFIGHT → "ufc-fight"
+_KALSHI_SERIES_SLUG_MAP: dict[str, str] = {
+    "KXNHLGAME":     "nhl-game",
+    "KXNBAGAME":     "nba-game",
+    "KXNFLGAME":     "nfl-game",
+    "KXMLBGAME":     "mlb-game",
+    "KXNCAAMBGAME":  "ncaamb-game",
+    "KXNCAAWBGAME":  "ncaawb-game",
+    "KXUFCFIGHT":    "ufc-fight",
+    "KXNCAAFGAME":   "ncaaf-game",
+    "KXNBAGMPTS":    "nba-game-points",
+    "KXNBAGMSPRD":   "nba-game-spread",
+    "KXNFLGMPTS":    "nfl-game-points",
+    "KXNFLGMSPRD":   "nfl-game-spread",
+}
+
+
+def _kalshi_series_to_slug(series_ticker: str) -> str:
+    """Convert a Kalshi series ticker to the URL slug used in /markets/ paths."""
+    slug = _KALSHI_SERIES_SLUG_MAP.get(series_ticker.upper())
+    if slug:
+        return slug
+    # Fallback: strip "KX" prefix, split on known suffixes, lowercase
+    base = series_ticker.upper().removeprefix("KX").lower()
+    for suffix in ("game", "fight"):
+        if base.endswith(suffix):
+            return f"{base[:-len(suffix)]}-{suffix}"
+    return base
+
+
 # ─────────────────────────────────────────────
 # PRICE CONVERSION
 # ─────────────────────────────────────────────
@@ -151,7 +182,13 @@ def pm_price_to_decimal(ask: float, fee_rate: float = 0.0) -> float:
     if net_payout <= 0:
         return 0.0
 
-    return round(net_payout / ask, 6)
+    dec = round(net_payout / ask, 6)
+    # Reject extreme odds that are not realistically tradeable:
+    # - Below 1.01 (decimal) = heavier than -10000 American (extreme favorite)
+    # - Above 100.0 (decimal) = +9900 American (extreme longshot, near-zero liquidity)
+    if dec < 1.01 or dec > 100.0:
+        return 0.0
+    return dec
 
 
 def decimal_to_american(dec: float) -> int:
@@ -643,7 +680,7 @@ def _parse_teams_from_title(title: str) -> tuple[str, str] | None:
     Returns None if unparseable.
     """
     cleaned = _strip_sport_prefix(title)
-    for sep, home_is_right in [(" vs. ", False), (" vs ", False), (" at ", True), (" @ ", True), (" v ", False)]:
+    for sep, home_is_right in [(" vs. ", True), (" vs ", True), (" at ", True), (" @ ", True), (" v ", True)]:
         if sep in cleaned:
             parts = cleaned.split(sep, 1)
             if len(parts) == 2:
@@ -653,9 +690,7 @@ def _parse_teams_from_title(title: str) -> tuple[str, str] | None:
                 right = re.sub(r"\s*[\(\[].*", "", right).strip()
                 left = re.sub(r"\s*[\(\[].*", "", left).strip()
                 if home_is_right:
-                    return right, left  # (home, away) — "Away at Home"
-                else:
-                    return left, right  # (home, away) — "Home vs Away"
+                    return right, left  # (home, away) — "Away at/vs Home"
     return None
 
 
@@ -809,28 +844,51 @@ async def _fetch_kalshi_series(
                     continue
 
                 executable_ask = None
+                ask_source = "none"
                 ask_dollars = _safe_float(m.get("yes_ask_dollars"))
                 ask_size_fp = _safe_float(m.get("yes_ask_size_fp"))
                 if ask_dollars is not None:
-                    top_notional = ask_dollars * ask_size_fp if ask_size_fp is not None else 0.0
-                    if top_notional >= CLOB_MIN_SIZE:
-                        executable_ask = ask_dollars
+                    # If we have size info, check the top-of-book notional
+                    if ask_size_fp is not None:
+                        top_notional = ask_dollars * ask_size_fp
+                        if top_notional >= CLOB_MIN_SIZE:
+                            executable_ask = ask_dollars
+                            ask_source = "top_of_book"
+                        else:
+                            ticker = str(m.get("ticker") or "")
+                            executable_ask = await _fetch_kalshi_executable_yes_ask(
+                                session,
+                                api_key,
+                                private_key,
+                                ticker,
+                                orderbook_cache,
+                                min_notional=CLOB_MIN_SIZE,
+                            )
+                            ask_source = "orderbook_walk"
+                            # Cap orderbook walk divergence: if walked price
+                            # diverges > 5¢ from top-of-book, discard it to
+                            # avoid quoting misleading deep-book prices.
+                            if executable_ask is not None and abs(executable_ask - ask_dollars) > 0.05:
+                                logger.info(
+                                    "Kalshi orderbook walk diverged %.3f vs top-of-book %.3f for %s — using top-of-book",
+                                    executable_ask, ask_dollars, ticker,
+                                )
+                                executable_ask = ask_dollars
+                                ask_source = "top_of_book_capped"
                     else:
-                        ticker = str(m.get("ticker") or "")
-                        executable_ask = await _fetch_kalshi_executable_yes_ask(
-                            session,
-                            api_key,
-                            private_key,
-                            ticker,
-                            orderbook_cache,
-                            min_notional=CLOB_MIN_SIZE,
-                        )
+                        # Kalshi API provides yes_ask_dollars but no size — treat
+                        # the quoted ask as executable rather than hitting the
+                        # orderbook for every single market (avoids 40+ extra API calls).
+                        executable_ask = ask_dollars
+                        ask_source = "ask_dollars_no_size"
                 else:
                     # Last-resort legacy fallback if *_dollars is absent.
                     executable_ask = _safe_float(m.get("yes_ask"))
+                    ask_source = "yes_ask_fallback"
 
                 m["_executable_yes_ask"] = executable_ask
                 m["_executable_yes_ask_checked"] = True
+                m["_ask_source"] = ask_source
 
         for raw in raw_events:
             parsed = _parse_kalshi_event(raw, sport, fetch_ts)
@@ -854,7 +912,16 @@ def _parse_kalshi_event(raw: dict, sport: str, fetch_ts: str) -> list[dict]:
     """
     title = raw.get("title") or ""
     event_ticker = raw.get("event_ticker") or ""
-    event_url = f"https://kalshi.com/markets/{event_ticker}"
+    series_ticker = raw.get("series_ticker") or ""
+
+    # Build correct Kalshi deep link: /markets/{series}/{slug}/{event} all lowercase
+    if event_ticker and series_ticker:
+        slug = _kalshi_series_to_slug(series_ticker)
+        event_url = f"https://kalshi.com/markets/{series_ticker.lower()}/{slug}/{event_ticker.lower()}"
+    elif event_ticker:
+        event_url = f"https://kalshi.com/markets/{event_ticker.lower()}"
+    else:
+        event_url = "https://kalshi.com/browse/sports"
 
     markets = raw.get("markets") or []
     active = [m for m in markets if m.get("status") in ("open", "active") and not m.get("result")]
@@ -900,8 +967,27 @@ def _parse_kalshi_event(raw: dict, sport: str, fetch_ts: str) -> list[dict]:
         yes_ask_b = _safe_float(team_b_m.get("_executable_yes_ask"))
 
         if yes_ask_a and yes_ask_b and sub_a and sub_b:
+            # Reject thin books where both sides' ask prices are too low
+            if yes_ask_a + yes_ask_b < 0.85:
+                logger.info(
+                    "KALSHI_SKIP thin books: %s — ask_a=%.3f + ask_b=%.3f = %.3f < 0.85",
+                    title, yes_ask_a, yes_ask_b, yes_ask_a + yes_ask_b,
+                )
+                return []
+
             dec_a = pm_price_to_decimal(yes_ask_a, fee_rate=KALSHI_FEE_RATE)
             dec_b = pm_price_to_decimal(yes_ask_b, fee_rate=KALSHI_FEE_RATE)
+
+            # Diagnostic logging: trace actual prices → odds
+            am_a_dbg = decimal_to_american(dec_a) if dec_a > 1.0 else 0
+            am_b_dbg = decimal_to_american(dec_b) if dec_b > 1.0 else 0
+            src_a = team_a_m.get("_ask_source", "?")
+            src_b = team_b_m.get("_ask_source", "?")
+            logger.info(
+                "KALSHI_ODDS %s: %s ask=%.4f(%s) dec=%.4f am=%+d | %s ask=%.4f(%s) dec=%.4f am=%+d",
+                title, sub_a, yes_ask_a, src_a, dec_a, am_a_dbg,
+                sub_b, yes_ask_b, src_b, dec_b, am_b_dbg,
+            )
             if dec_a > 1.0 and dec_b > 1.0:
                 # Try to determine home/away from title
                 teams_from_title = _parse_teams_from_title(title)
@@ -950,44 +1036,11 @@ def _parse_kalshi_event(raw: dict, sport: str, fetch_ts: str) -> list[dict]:
                     },
                 ]
 
-                # Parse Kalshi NO contract asks. NO on one team means the
-                # opposing team wins, so selection is the opposite side.
-                no_ask_a = _first_valid_price(team_a_m.get("no_ask_dollars"), team_a_m.get("no_ask"))
-                no_ask_b = _first_valid_price(team_b_m.get("no_ask_dollars"), team_b_m.get("no_ask"))
-                if no_ask_a:
-                    no_dec_a = pm_price_to_decimal(no_ask_a, fee_rate=KALSHI_FEE_RATE)
-                    if no_dec_a > 1.0:
-                        no_selection_a = "away" if home_team == sub_a else "home"
-                        moneyline_markets.append({
-                            "market_type": "moneyline",
-                            "selection": no_selection_a,
-                            "team": away_team if no_selection_a == "away" else home_team,
-                            "american_odds": decimal_to_american(no_dec_a),
-                            "decimal_odds": no_dec_a,
-                            "line_value": None,
-                            "source": "kalshi",
-                            "_contract_type": "NO",
-                            "_source_book": "kalshi",
-                            "ask_price": no_ask_a,
-                            "updated_at": fetch_ts,
-                        })
-                if no_ask_b:
-                    no_dec_b = pm_price_to_decimal(no_ask_b, fee_rate=KALSHI_FEE_RATE)
-                    if no_dec_b > 1.0:
-                        no_selection_b = "away" if home_team == sub_b else "home"
-                        moneyline_markets.append({
-                            "market_type": "moneyline",
-                            "selection": no_selection_b,
-                            "team": away_team if no_selection_b == "away" else home_team,
-                            "american_odds": decimal_to_american(no_dec_b),
-                            "decimal_odds": no_dec_b,
-                            "line_value": None,
-                            "source": "kalshi",
-                            "_contract_type": "NO",
-                            "_source_book": "kalshi",
-                            "ask_price": no_ask_b,
-                            "updated_at": fetch_ts,
-                        })
+                # NOTE: We intentionally do NOT add NO contract derived odds here.
+                # On Kalshi's CLOB, the NO ask price differs from (1 - YES ask) due to
+                # bid-ask spread. Using NO-derived odds creates inflated positive values
+                # (e.g., +101 instead of -121) that produce phantom arbs. The YES contract
+                # prices are the authoritative source for each team's moneyline odds.
 
                 results.append({
                     "source": "kalshi",
@@ -1226,15 +1279,46 @@ def _pm_market_type(question: str) -> str | None:
 
 
 def _extract_line_from_question(question: str) -> float | None:
-    """Extract numeric line value from a spread/total question like 'over 215.5'."""
-    nums = re.findall(r"\d+\.?\d*", question)
-    if nums:
-        # Take the last number — avoids dates/years at start
+    """Extract numeric line value from a spread/total question like 'over 215.5'.
+
+    Strategy:
+      1. Look for a number immediately after a keyword (over/under/by/spread/+/-).
+      2. Prefer numbers with a decimal point (spreads/totals almost always use .5).
+      3. Exclude year-like 4-digit integers (2020–2039) to avoid date confusion.
+    """
+    # Prefer numbers adjacent to betting keywords
+    kw_match = re.search(
+        r"(?:over|under|by|spread|[+-])\s*(\d+\.?\d*)",
+        question,
+        flags=re.IGNORECASE,
+    )
+    if kw_match:
         try:
-            return float(nums[-1])
+            return float(kw_match.group(1))
         except ValueError:
             pass
-    return None
+
+    # Fallback: find all numbers, filter out year-like values, prefer decimals
+    raw_nums = re.findall(r"\d+\.?\d*", question)
+    candidates: list[tuple[float, bool]] = []  # (value, has_decimal)
+    for raw in raw_nums:
+        try:
+            val = float(raw)
+        except ValueError:
+            continue
+        # Skip 4-digit whole numbers in the year range (2020-2039)
+        if "." not in raw and 2020 <= val <= 2039:
+            continue
+        candidates.append((val, "." in raw))
+
+    if not candidates:
+        return None
+
+    # Prefer numbers with decimal points (typical for spread/total lines)
+    decimals = [val for val, has_dot in candidates if has_dot]
+    if decimals:
+        return decimals[-1]
+    return candidates[-1][0]
 
 
 def _parse_polymarket_event(raw: dict, sport: str, fetch_ts: str) -> dict | None:
@@ -1320,31 +1404,20 @@ def _parse_polymarket_event(raw: dict, sport: str, fetch_ts: str) -> dict | None
         if outcome_a.lower() in ("home", "away") or outcome_b.lower() in ("home", "away"):
             return None
 
+        # Polymarket convention: outcomes[0] = away team (first in "X vs Y" title),
+        # outcomes[1] = home team (second in title). Verified empirically against
+        # ESPN schedules — the "vs" format always lists Away vs Home.
         return {
             "source": "polymarket",
             "sport": sport,
-            "home_team": outcome_a,
-            "away_team": outcome_b,
+            "home_team": outcome_b,
+            "away_team": outcome_a,
             "start_time": start_time,
             "event_url": event_url,
             "markets": [
                 {
                     "market_type": "moneyline",
                     "selection": "home",
-                    "team": outcome_a,
-                    "american_odds": decimal_to_american(dec_a),
-                    "decimal_odds": dec_a,
-                    "line_value": None,
-                    "source": "polymarket",
-                    "_contract_type": "YES",
-                    "_source_book": "polymarket",
-                    "ask_price": price_a,   # mid-price placeholder, updated by CLOB
-                    "updated_at": fetch_ts,
-                    "_clob_token": token_a,
-                },
-                {
-                    "market_type": "moneyline",
-                    "selection": "away",
                     "team": outcome_b,
                     "american_odds": decimal_to_american(dec_b),
                     "decimal_odds": dec_b,
@@ -1355,6 +1428,20 @@ def _parse_polymarket_event(raw: dict, sport: str, fetch_ts: str) -> dict | None
                     "ask_price": price_b,
                     "updated_at": fetch_ts,
                     "_clob_token": token_b,
+                },
+                {
+                    "market_type": "moneyline",
+                    "selection": "away",
+                    "team": outcome_a,
+                    "american_odds": decimal_to_american(dec_a),
+                    "decimal_odds": dec_a,
+                    "line_value": None,
+                    "source": "polymarket",
+                    "_contract_type": "YES",
+                    "_source_book": "polymarket",
+                    "ask_price": price_a,   # mid-price placeholder, updated by CLOB
+                    "updated_at": fetch_ts,
+                    "_clob_token": token_a,
                 },
             ],
             "_raw_poly_id": raw.get("id"),
@@ -1410,6 +1497,11 @@ def _parse_polymarket_event(raw: dict, sport: str, fetch_ts: str) -> dict | None
                 },
             ],
         }
+
+    elif mtype == "spread":
+        # TODO: implement Polymarket spread parsing once we verify the market
+        # structure (outcome labels, line value placement, etc).
+        logger.debug("Polymarket spread market skipped (not yet implemented): %s", question)
 
     return None
 

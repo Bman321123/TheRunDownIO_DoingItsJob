@@ -84,7 +84,7 @@ _DEFAULT_SPORT_PATHS: dict[str, str] = {
 }
 
 _ALLOWED_GROUPS = {"game lines", "alternate lines"}
-_ALLOWED_PERIODS = {"game", "match", ""}
+_ALLOWED_PERIODS = {"game", "match", "", "live game", "live match"}
 
 
 def _build_headers(referer: Optional[str] = None) -> dict[str, str]:
@@ -242,22 +242,44 @@ def _resolve_market_type(description: str) -> Optional[str]:
     return None
 
 
-def _infer_selection(outcome: dict[str, Any], market_type: str, label: str) -> str:
+def _infer_selection(
+    outcome: dict[str, Any],
+    market_type: str,
+    label: str,
+    home_team: str = "",
+    away_team: str = "",
+) -> Optional[str]:
     label_lower = label.lower()
     if market_type == "total":
         if "over" in label_lower:
             return "over"
         if "under" in label_lower:
             return "under"
+
     otype = (outcome.get("type") or "").upper()
     if otype == "H":
         return "home"
     if otype == "A":
         return "away"
-    return "home"
+
+    # Fallback: match outcome label against known team names
+    if home_team and home_team.lower() in label_lower:
+        return "home"
+    if away_team and away_team.lower() in label_lower:
+        return "away"
+
+    # Cannot determine side — return None to skip this outcome rather than
+    # default to "home" which causes both sides to be labeled home.
+    logger.warning("Bovada: cannot infer selection for outcome label=%r type=%r", label, otype)
+    return None
 
 
-def _parse_outcome(outcome: dict[str, Any], market_type: str) -> Optional[dict[str, Any]]:
+def _parse_outcome(
+    outcome: dict[str, Any],
+    market_type: str,
+    home_team: str = "",
+    away_team: str = "",
+) -> Optional[dict[str, Any]]:
     price = outcome.get("price") or {}
     if not price:
         return None
@@ -285,7 +307,9 @@ def _parse_outcome(outcome: dict[str, Any], market_type: str) -> Optional[dict[s
                 line_value = None
 
     label = (outcome.get("description") or "").strip()
-    selection = _infer_selection(outcome, market_type, label)
+    selection = _infer_selection(outcome, market_type, label, home_team, away_team)
+    if selection is None:
+        return None
 
     return {
         "market_type": market_type,
@@ -297,7 +321,11 @@ def _parse_outcome(outcome: dict[str, Any], market_type: str) -> Optional[dict[s
     }
 
 
-def _extract_odds(raw_event: dict[str, Any]) -> list[dict[str, Any]]:
+def _extract_odds(
+    raw_event: dict[str, Any],
+    home_team: str = "",
+    away_team: str = "",
+) -> list[dict[str, Any]]:
     odds_lines: list[dict[str, Any]] = []
 
     for group in raw_event.get("displayGroups", []):
@@ -316,7 +344,7 @@ def _extract_odds(raw_event: dict[str, Any]) -> list[dict[str, Any]]:
                 continue
 
             for outcome in market.get("outcomes", []):
-                line = _parse_outcome(outcome, market_type)
+                line = _parse_outcome(outcome, market_type, home_team, away_team)
                 if line is not None:
                     odds_lines.append(line)
 
@@ -336,7 +364,7 @@ def _parse_single_event(raw_event: dict[str, Any], sport: str) -> Optional[dict[
         return None
 
     start_time = _parse_start_time(raw_event.get("startTime"))
-    markets = _extract_odds(raw_event)
+    markets = _extract_odds(raw_event, home_team, away_team)
     link = raw_event.get("link") or ""
     event_url = f"https://www.bovada.lv/sports{link}" if link else ""
 

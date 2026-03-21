@@ -1,10 +1,21 @@
 import { normalizeBookName, type BookKey } from "./books";
 
 /**
- * Build a deep link URL to a sportsbook's search page for a given team.
- * Falls back to the sportsbook's homepage if the book is unknown.
+ * Build a deep link URL for a sportsbook.
+ *
+ * Priority:
+ *   1. Direct event URL from backend (bovada/kalshi/polymarket scrapers)
+ *   2. Search-based URL using team name (DraftKings, FanDuel, BetMGM)
+ *   3. Sport-level fallback for books without search
  */
-export function buildDeepLink(bookName: string, teamName: string): string {
+export function buildDeepLink(
+  bookName: string,
+  teamName: string,
+  directUrl?: string,
+): string {
+  // If we have a direct event URL from the scraper, use it
+  if (directUrl) return directUrl;
+
   const key: BookKey = normalizeBookName(bookName);
   const q = encodeURIComponent(teamName.trim());
 
@@ -21,6 +32,8 @@ export function buildDeepLink(bookName: string, teamName: string): string {
       return "https://polymarket.com/sports";
     case "bovada":
       return "https://www.bovada.lv/sports";
+    case "novig":
+      return "https://novig.com/events";
     default:
       return "#";
   }

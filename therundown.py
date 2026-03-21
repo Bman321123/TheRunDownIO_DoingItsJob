@@ -557,6 +557,24 @@ def build_market_index(event: dict) -> tuple[dict, dict, set[int], set[int]]:
     raw_book_ids_seen: set[int] = set()
     used_book_ids_seen: set[int] = set()
 
+    # Resolve home/away team names from the event so we can match participants
+    # by name rather than relying on array ordering (which the API doesn't guarantee).
+    _game, resolved_home, resolved_away = _resolve_teams(event)
+    resolved_home_lc = resolved_home.lower().strip()
+    resolved_away_lc = resolved_away.lower().strip()
+
+    def _participant_side(pname_lower: str, idx: int) -> str | None:
+        """Determine if a participant is 'home' or 'away' using team names."""
+        # Exact or substring match against resolved team names
+        if resolved_home_lc and (resolved_home_lc in pname_lower or pname_lower in resolved_home_lc):
+            return "home"
+        if resolved_away_lc and (resolved_away_lc in pname_lower or pname_lower in resolved_away_lc):
+            return "away"
+        # Fallback to array ordering (idx 0 = away, idx 1 = home) only when
+        # name matching fails — this preserves the original behavior for events
+        # where team names in participants don't match the teams array.
+        return "away" if idx == 0 else "home"
+
     for m in markets:
         if not isinstance(m, dict):
             continue
@@ -594,11 +612,8 @@ def build_market_index(event: dict) -> tuple[dict, dict, set[int], set[int]]:
                     side_label = "over"
                 elif "under" in pname:
                     side_label = "under"
-            elif is_spread:
-                # Assume ordering: first = away, second = home
-                side_label = "away" if idx == 0 else "home"
-            elif is_ml:
-                side_label = "away" if idx == 0 else "home"
+            elif is_spread or is_ml:
+                side_label = _participant_side(pname, idx)
 
             if not side_label:
                 continue
@@ -677,6 +692,7 @@ def build_market_index(event: dict) -> tuple[dict, dict, set[int], set[int]]:
                             "price_am": pam_disp,
                             "price_dec": dec,
                             "updated_at": updated_at,
+                            "_event_url": price_obj.get("_event_url", ""),
                         }
                     )
 
@@ -691,6 +707,7 @@ def build_market_index(event: dict) -> tuple[dict, dict, set[int], set[int]]:
                                     "price_am": pam_disp,
                                     "price_dec": dec,
                                     "updated_at": updated_at,
+                                    "_event_url": price_obj.get("_event_url", ""),
                                 }
                             )
                         elif side_label == "away" and line_value > 0:
@@ -700,6 +717,7 @@ def build_market_index(event: dict) -> tuple[dict, dict, set[int], set[int]]:
                                     "price_am": pam_disp,
                                     "price_dec": dec,
                                     "updated_at": updated_at,
+                                    "_event_url": price_obj.get("_event_url", ""),
                                 }
                             )
 
@@ -778,6 +796,7 @@ def build_market_index(event: dict) -> tuple[dict, dict, set[int], set[int]]:
                             "price_am": pam_disp,
                             "price_dec": dec,
                             "updated_at": updated_at,
+                            "_event_url": obj.get("_event_url", ""),
                         }
                     )
 
@@ -1177,6 +1196,7 @@ def analyze_event(event: dict, sport_name: str) -> tuple[list[dict], list[dict]]
                     "book": option["book"],
                     "odds_am": option["price_am"],
                     "updated_at": option.get("updated_at"),
+                    "url": option.get("_event_url", ""),
                 })
 
         side_a_list = sides.get(side_a_key) or []
@@ -1241,11 +1261,13 @@ def analyze_event(event: dict, sport_name: str) -> tuple[list[dict], list[dict]]
                 "odds_a_am":      best_a["price_am"],
                 "odds_a_dec":     dec_a,
                 "updated_at_a":   best_a.get("updated_at"),
+                "url_a":          best_a.get("_event_url", ""),
                 "side_b":         side_b_key.capitalize(),
                 "book_b":         best_b["book"],
                 "odds_b_am":      best_b["price_am"],
                 "odds_b_dec":     dec_b,
                 "updated_at_b":   best_b.get("updated_at"),
+                "url_b":          best_b.get("_event_url", ""),
                 "fresh_ts":       fresh_ts,
                 "stale_ts":       stale_ts,
                 "fresh_age_s":    fresh_age_s,
@@ -1274,6 +1296,7 @@ def analyze_event(event: dict, sport_name: str) -> tuple[list[dict], list[dict]]
                     "book": option["book"],
                     "odds_am": option["price_am"],
                     "updated_at": option.get("updated_at"),
+                    "url": option.get("_event_url", ""),
                 })
 
         if not home_minus or not away_plus:
@@ -1334,11 +1357,13 @@ def analyze_event(event: dict, sport_name: str) -> tuple[list[dict], list[dict]]
                 "odds_a_am":      best_home["price_am"],
                 "odds_a_dec":     dec_home,
                 "updated_at_a":   best_home.get("updated_at"),
+                "url_a":          best_home.get("_event_url", ""),
                 "side_b":         "Away",
                 "book_b":         best_away["book"],
                 "odds_b_am":      best_away["price_am"],
                 "odds_b_dec":     dec_away,
                 "updated_at_b":   best_away.get("updated_at"),
+                "url_b":          best_away.get("_event_url", ""),
                 "fresh_ts":       fresh_ts,
                 "stale_ts":       stale_ts,
                 "fresh_age_s":    fresh_age_s,
@@ -1462,10 +1487,12 @@ def compute_best_lines_for_event(event: dict, sport_name: str) -> list[dict]:
                     "home": {
                         "book": best_home["book"],
                         "odds_am": best_home["price_am"],
+                        "url": best_home.get("_event_url", ""),
                     },
                     "away": {
                         "book": best_away["book"],
                         "odds_am": best_away["price_am"],
+                        "url": best_away.get("_event_url", ""),
                     },
                 }
             )
@@ -1488,6 +1515,7 @@ def compute_best_lines_for_event(event: dict, sport_name: str) -> list[dict]:
                         "pick": {
                             "book": best["book"],
                             "odds_am": best["price_am"],
+                            "url": best.get("_event_url", ""),
                         },
                     }
                 )
@@ -1509,10 +1537,12 @@ def compute_best_lines_for_event(event: dict, sport_name: str) -> list[dict]:
                     "over": {
                         "book": best_over["book"],
                         "odds_am": best_over["price_am"],
+                        "url": best_over.get("_event_url", ""),
                     },
                     "under": {
                         "book": best_under["book"],
                         "odds_am": best_under["price_am"],
+                        "url": best_under.get("_event_url", ""),
                     },
                 }
             )

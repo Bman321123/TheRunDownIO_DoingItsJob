@@ -33,9 +33,9 @@ _SPORT_TO_SERIES: dict[str, list[str]] = {
 ALL_SPORT_KEYS = list(_SPORT_TO_SERIES.keys())
 
 
-def _prob_to_american(prob: float) -> int | None:
+def _prob_to_odds(prob: float) -> tuple[int, float] | None:
     """
-    Polymarket price (0.0-1.0) -> American odds integer after fees.
+    Polymarket price (0.0-1.0) -> (american_odds, decimal_odds) after fees.
 
     Fee is applied to PROFIT (net payout), not settlement value:
         net_payout   = 1 - fee_rate × (1 - prob)
@@ -50,8 +50,10 @@ def _prob_to_american(prob: float) -> int | None:
         return None
 
     if dec >= 2.0:
-        return round((dec - 1) * 100)
-    return round(-100 / (dec - 1))
+        am = round((dec - 1) * 100)
+    else:
+        am = round(-100 / (dec - 1))
+    return am, round(dec, 6)
 
 
 def fetch_polymarket_markets(sport_keys: list[str] | None = None) -> list[dict[str, Any]]:
@@ -143,10 +145,19 @@ def _find_moneyline_market(group: dict, sub_markets: list[dict]) -> dict[str, An
         if len(prices) != 2:
             continue
 
-        am_away = _prob_to_american(prices[0])
-        am_home = _prob_to_american(prices[1])
-        if am_away is None or am_home is None:
+        # Polymarket convention (verified empirically against ESPN schedules):
+        # outcomes[0] / prices[0] = away team (first in "X vs Y" title)
+        # outcomes[1] / prices[1] = home team (second in title)
+        # Reject events where both sides' prices are too low (thin books)
+        if prices[0] + prices[1] < 0.85:
             continue
+
+        odds_away = _prob_to_odds(prices[0])
+        odds_home = _prob_to_odds(prices[1])
+        if odds_away is None or odds_home is None:
+            continue
+        am_away, dec_away = odds_away
+        am_home, dec_home = odds_home
 
         away_team, home_team = _parse_teams_from_title(group_title)
 
@@ -173,17 +184,23 @@ def _find_moneyline_market(group: dict, sub_markets: list[dict]) -> dict[str, An
         if _looks_generic_team_label(away_team) or _looks_generic_team_label(home_team):
             return None
 
+        # Build direct event URL from the group slug
+        slug = group.get("slug") or ""
+        event_url = f"https://polymarket.com/event/{slug}" if slug else "https://polymarket.com/sports"
+
         now = datetime.datetime.now(datetime.timezone.utc).isoformat()
         return {
             "home_team": home_team,
             "away_team": away_team,
             "source": "polymarket",
+            "event_url": event_url,
             "markets": [
                 {
                     "market_type": "moneyline",
                     "selection": "home",
                     "affiliate_name": "Polymarket",
                     "american_odds": am_home,
+                    "decimal_odds": dec_home,
                     "line_value": None,
                     "updated_at": now,
                 },
@@ -192,6 +209,7 @@ def _find_moneyline_market(group: dict, sub_markets: list[dict]) -> dict[str, An
                     "selection": "away",
                     "affiliate_name": "Polymarket",
                     "american_odds": am_away,
+                    "decimal_odds": dec_away,
                     "line_value": None,
                     "updated_at": now,
                 },

@@ -9,6 +9,9 @@ from typing import Any
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
+from dotenv import load_dotenv
+load_dotenv()
+
 from aiohttp import web
 from rapidfuzz import fuzz
 
@@ -17,6 +20,7 @@ import therundown
 import prediction_markets
 from kalshi_scraper import fetch_kalshi_markets
 from polymarket_scraper import fetch_polymarket_markets
+from novig_scraper import fetch_novig_markets
 
 # ──────────────────────────────────────────────
 # CONFIG
@@ -39,6 +43,17 @@ _RUNDOWN_TO_BOVADA_SPORT = {
 }
 
 _RUNDOWN_TO_PM_SPORT: dict[str, str] = {
+    "NFL":    "nfl",
+    "NBA":    "nba",
+    "NCAAB":  "ncaab",
+    "MLB":    "mlb",
+    "NHL":    "nhl",
+    "NCAAWB": "ncaawb",
+    "MMA":    "mma",
+    "NCAAF":  "ncaaf",
+}
+
+_RUNDOWN_TO_NOVIG_SPORT: dict[str, str] = {
     "NFL":    "nfl",
     "NBA":    "nba",
     "NCAAB":  "ncaab",
@@ -293,11 +308,13 @@ _CLIENT = therundown.RundownClient(therundown.API_KEY, therundown.USE_RAPIDAPI)
 KALSHI_BOOK_ID     = 9001
 POLYMARKET_BOOK_ID = 9002
 BOVADA_BOOK_ID     = 9003
+NOVIG_BOOK_ID      = 9004
 
 therundown.KNOWN_BOOKS[KALSHI_BOOK_ID]     = "Kalshi"
 therundown.KNOWN_BOOKS[POLYMARKET_BOOK_ID] = "Polymarket"
 therundown.KNOWN_BOOKS[BOVADA_BOOK_ID]     = "Bovada"
-therundown.ALLOWED_BOOK_NAMES.update({"kalshi", "polymarket", "bovada"})
+therundown.KNOWN_BOOKS[NOVIG_BOOK_ID]      = "Novig"
+therundown.ALLOWED_BOOK_NAMES.update({"kalshi", "polymarket", "bovada", "novig"})
 
 # Affiliate cache — /affiliates data changes at most monthly; refresh daily.
 _AFFILIATES_TTL: int = 86400
@@ -316,6 +333,7 @@ def _refresh_affiliates_if_stale() -> None:
         merged[KALSHI_BOOK_ID]     = "Kalshi"
         merged[POLYMARKET_BOOK_ID] = "Polymarket"
         merged[BOVADA_BOOK_ID]     = "Bovada"
+        merged[NOVIG_BOOK_ID]      = "Novig"
         therundown.KNOWN_BOOKS = merged
         _affiliates_last_fetched = time.time()
         print(f"  AFFILIATES :: refreshed ({len(fresh)} books cached for {_AFFILIATES_TTL}s)")
@@ -785,6 +803,36 @@ async def _fetch_pm_events_for_sports(
     return kalshi_events, poly_events
 
 
+async def _fetch_novig_events_for_sports(
+    selected_names: list[str],
+) -> list[dict[str, Any]]:
+    """Fetch Novig exchange events for the selected sports."""
+    sport_keys = [
+        _RUNDOWN_TO_NOVIG_SPORT[name]
+        for name in selected_names
+        if name in _RUNDOWN_TO_NOVIG_SPORT
+    ]
+    if not sport_keys:
+        return []
+    return await fetch_novig_markets(sport_keys)
+
+
+_SELECTION_FLIP = {"home": "away", "away": "home"}
+
+
+def _flip_market(m: dict[str, Any]) -> dict[str, Any]:
+    """Flip a flat market's selection (home↔away) and negate spread line_value."""
+    flipped = {**m, "selection": _SELECTION_FLIP.get(m.get("selection", ""), m.get("selection", ""))}
+    if str(m.get("market_type", "")).lower() == "spread":
+        lv = m.get("line_value")
+        if lv is not None:
+            try:
+                flipped["line_value"] = -float(lv)
+            except (TypeError, ValueError):
+                pass
+    return flipped
+
+
 def _match_source_to_hubs(
     source_events: list[dict[str, Any]],
     hub_events: list[dict[str, Any]],
@@ -844,12 +892,7 @@ def _match_source_to_hubs(
 
         markets = list(src_event.get("markets") or [])
         if best_swapped:
-            for m in markets:
-                sel = m.get("selection", "")
-                if sel == "home":
-                    m = {**m, "selection": "away"}
-                elif sel == "away":
-                    m = {**m, "selection": "home"}
+            markets = [_flip_market(m) for m in markets]
             logger.debug("%s: swapped home/away for %s vs %s", source_name, s_home, s_away)
 
         matched.setdefault(best_idx, []).extend(markets)
@@ -857,19 +900,33 @@ def _match_source_to_hubs(
     return matched, unmatched
 
 
+def _tag_markets_with_event_url(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Stamp each market dict inside every event with the parent event_url."""
+    for evt in events:
+        url = evt.get("event_url") or ""
+        for m in evt.get("markets") or []:
+            m["_event_url"] = url
+    return events
+
+
 def _merge_all_sources(
     rundown_events:  list[dict[str, Any]],
     bovada_events:   list[dict[str, Any]],
     kalshi_events:   list[dict[str, Any]],
     poly_events:     list[dict[str, Any]],
+    novig_events:    list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """
-    Match Bovada, Kalshi, and Polymarket events to TheRundown hubs.
-    Returns consolidated event list with books: {bovada, kalshi, polymarket} + _raw_event.
+    Match Bovada, Kalshi, Polymarket, and Novig events to TheRundown hubs.
+    Returns consolidated event list with books: {bovada, kalshi, polymarket, novig} + _raw_event.
+    Markets must already be tagged with _event_url via _tag_markets_with_event_url().
     """
+    if novig_events is None:
+        novig_events = []
     bovada_match,   _bovada_unmatched   = _match_source_to_hubs(bovada_events,  rundown_events, "bovada")
     kalshi_match,   _kalshi_unmatched   = _match_source_to_hubs(kalshi_events,  rundown_events, "kalshi")
     poly_match,     _poly_unmatched     = _match_source_to_hubs(poly_events,    rundown_events, "polymarket")
+    novig_match,    _novig_unmatched    = _match_source_to_hubs(novig_events,   rundown_events, "novig")
 
     consolidated: list[dict[str, Any]] = []
 
@@ -878,6 +935,7 @@ def _merge_all_sources(
             "bovada":     bovada_match.get(idx, []),
             "kalshi":     kalshi_match.get(idx, []),
             "polymarket": poly_match.get(idx, []),
+            "novig":      novig_match.get(idx, []),
         }
         if not any(books.values()):
             continue
@@ -892,11 +950,12 @@ def _merge_all_sources(
         })
 
     logger.info(
-        "Merged %d cross-source events (bovada:%d, kalshi:%d, poly:%d matched hubs)",
+        "Merged %d cross-source events (bovada:%d, kalshi:%d, poly:%d, novig:%d matched hubs)",
         len(consolidated),
         sum(1 for v in bovada_match.values() if v),
         sum(1 for v in kalshi_match.values() if v),
         sum(1 for v in poly_match.values() if v),
+        sum(1 for v in novig_match.values() if v),
     )
     return consolidated
 
@@ -961,9 +1020,12 @@ def _match_intersection_events(
         used_rundown_indices.add(best_idx)
         matched_rundown = rundown_events[best_idx]
 
+        bovada_markets = list(bovada_event.get("markets") or [])
         if best_swapped:
             home_team = str(bovada_event.get("away_team", ""))
             away_team = str(bovada_event.get("home_team", ""))
+            # Flip market selections AND negate spread line values
+            bovada_markets = [_flip_market(m) for m in bovada_markets]
         else:
             home_team = str(bovada_event.get("home_team", ""))
             away_team = str(bovada_event.get("away_team", ""))
@@ -975,7 +1037,7 @@ def _match_intersection_events(
             "away_team": away_team,
             "matchScore": round(best_score, 2),
             "books": {
-                "bovada": bovada_event.get("markets", []),
+                "bovada": bovada_markets,
                 "therundown": matched_rundown.get("markets", []),
             },
         }
@@ -1291,6 +1353,7 @@ def _bovada_events_to_best_lines(bovada_events: list[dict[str, Any]]) -> list[di
         moneyline_away = _best_american_option(
             [m for m in markets if m.get("market_type") == "moneyline" and str(m.get("selection")).lower() == "away"]
         )
+        evt_url = str(event.get("event_url") or "")
         if moneyline_home and moneyline_away:
             best_lines.append(
                 {
@@ -1299,8 +1362,8 @@ def _bovada_events_to_best_lines(bovada_events: list[dict[str, Any]]) -> list[di
                     "game": game,
                     "home_team": home_team,
                     "away_team": away_team,
-                    "home": {"book": "Bovada", "odds_am": int(moneyline_home["american_odds"])},
-                    "away": {"book": "Bovada", "odds_am": int(moneyline_away["american_odds"])},
+                    "home": {"book": "Bovada", "odds_am": int(moneyline_home["american_odds"]), "url": evt_url},
+                    "away": {"book": "Bovada", "odds_am": int(moneyline_away["american_odds"]), "url": evt_url},
                 }
             )
 
@@ -1322,7 +1385,7 @@ def _bovada_events_to_best_lines(bovada_events: list[dict[str, Any]]) -> list[di
                     "team": team,
                     "sport": sport,
                     "game": game,
-                    "pick": {"book": "Bovada", "odds_am": odds_am},
+                    "pick": {"book": "Bovada", "odds_am": odds_am, "url": evt_url},
                 }
             )
 
@@ -1352,8 +1415,8 @@ def _bovada_events_to_best_lines(bovada_events: list[dict[str, Any]]) -> list[di
                     "line": line_value,
                     "sport": sport,
                     "game": game,
-                    "over": {"book": "Bovada", "odds_am": int(best_over["american_odds"])},
-                    "under": {"book": "Bovada", "odds_am": int(best_under["american_odds"])},
+                    "over": {"book": "Bovada", "odds_am": int(best_over["american_odds"]), "url": evt_url},
+                    "under": {"book": "Bovada", "odds_am": int(best_under["american_odds"]), "url": evt_url},
                 }
             )
 
@@ -1401,10 +1464,12 @@ def _flat_markets_to_nested(flat_markets: list[dict], book_id: int) -> list[dict
                 {"name": "Away", "lines": [{"prices": {bid: {
                     "price": ml_away["american_odds"],
                     "updated_at": ml_away.get("updated_at") or now,
+                    "_event_url": ml_away.get("_event_url", ""),
                 }}}]},
                 {"name": "Home", "lines": [{"prices": {bid: {
                     "price": ml_home["american_odds"],
                     "updated_at": ml_home.get("updated_at") or now,
+                    "_event_url": ml_home.get("_event_url", ""),
                 }}}]},
             ],
         })
@@ -1441,10 +1506,12 @@ def _flat_markets_to_nested(flat_markets: list[dict], book_id: int) -> list[dict
                 {"name": "Away", "lines": [{"value": away_lv, "prices": {bid: {
                     "price": sp_away["american_odds"],
                     "updated_at": sp_away.get("updated_at") or now,
+                    "_event_url": sp_away.get("_event_url", ""),
                 }}}]},
                 {"name": "Home", "lines": [{"value": home_lv, "prices": {bid: {
                     "price": sp_home["american_odds"],
                     "updated_at": sp_home.get("updated_at") or now,
+                    "_event_url": sp_home.get("_event_url", ""),
                 }}}]},
             ],
         })
@@ -1462,10 +1529,12 @@ def _flat_markets_to_nested(flat_markets: list[dict], book_id: int) -> list[dict
                 {"name": "Over", "lines": [{"value": lv, "prices": {bid: {
                     "price": t_over["american_odds"],
                     "updated_at": t_over.get("updated_at") or now,
+                    "_event_url": t_over.get("_event_url", ""),
                 }}}]},
                 {"name": "Under", "lines": [{"value": lv, "prices": {bid: {
                     "price": t_under["american_odds"],
                     "updated_at": t_under.get("updated_at") or now,
+                    "_event_url": t_under.get("_event_url", ""),
                 }}}]},
             ],
         })
@@ -1509,13 +1578,14 @@ def _inject_matching_markets(
         return
 
     if best_swapped:
-        flip = {"home": "away", "away": "home"}
-        best_markets = [
-            {**m, "selection": flip.get(m.get("selection"), m.get("selection"))}
-            for m in best_markets
-        ]
+        best_markets = [_flip_market(m) for m in best_markets]
 
-    if book_id == KALSHI_BOOK_ID:
+    # Store flat reference markets from reliable sources (Bovada/Novig) so
+    # the Kalshi plausibility check can use them when sportsbook data is missing.
+    if book_id in (BOVADA_BOOK_ID, NOVIG_BOOK_ID):
+        bucket.setdefault("_flat_reference_markets", []).extend(best_markets)
+
+    if book_id in (KALSHI_BOOK_ID, POLYMARKET_BOOK_ID):
         sb_home_am: int | None = None
         sb_away_am: int | None = None
         raw_evt = bucket.get("_enriched_event") or {}
@@ -1545,11 +1615,21 @@ def _inject_matching_markets(
             None,
         )
         if isinstance(kalshi_home, int) and isinstance(kalshi_away, int):
+            # Fallback: if no sportsbook reference, use Bovada/Novig as reference
+            if sb_home_am is None or sb_away_am is None:
+                for ref_m in bucket.get("_flat_reference_markets", []):
+                    if ref_m.get("market_type") == "moneyline":
+                        if ref_m.get("selection") == "home" and sb_home_am is None:
+                            sb_home_am = ref_m.get("american_odds")
+                        elif ref_m.get("selection") == "away" and sb_away_am is None:
+                            sb_away_am = ref_m.get("american_odds")
+
             if not _kalshi_prices_are_plausible(kalshi_home, kalshi_away, sb_home_am, sb_away_am):
+                src_name = "Kalshi" if book_id == KALSHI_BOOK_ID else "Polymarket"
                 print(
-                    f"  KALSHI_SWAP_DETECTED [{bucket.get('home_team')} vs {bucket.get('away_team')}]: "
-                    f"Kalshi home={kalshi_home} away={kalshi_away} vs sportsbook home={sb_home_am} away={sb_away_am}. "
-                    f"Swapping Kalshi prices."
+                    f"  {src_name}_SWAP_DETECTED [{bucket.get('home_team')} vs {bucket.get('away_team')}]: "
+                    f"{src_name} home={kalshi_home} away={kalshi_away} vs ref home={sb_home_am} away={sb_away_am}. "
+                    f"Swapping {src_name} prices."
                 )
                 flip = {"home": "away", "away": "home"}
                 best_markets = [
@@ -1577,15 +1657,18 @@ def _build_unified_game_pool(
     bovada_events:  list[dict],
     kalshi_events:  list[dict],
     poly_events:    list[dict],
+    novig_events:   list[dict] | None = None,
     match_threshold: int = 75,
 ) -> list[dict]:
     """
-    Match events across all 4 sources into unified game buckets.
+    Match events across all sources into unified game buckets.
 
     Each bucket wraps a shallow copy of the TheRundown raw event (the anchor)
     and injects nested-format markets from every matched source so
     therundown.analyze_event can process them all in one pass.
     """
+    if novig_events is None:
+        novig_events = []
     buckets: list[dict] = []
 
     for rd_evt in rundown_events:
@@ -1611,6 +1694,7 @@ def _build_unified_game_pool(
 
         for source_list, bid in [
             (bovada_events, BOVADA_BOOK_ID),
+            (novig_events, NOVIG_BOOK_ID),
             (kalshi_events, KALSHI_BOOK_ID),
             (poly_events, POLYMARKET_BOOK_ID),
         ]:
@@ -1740,6 +1824,7 @@ def _market_dict_to_price_entry(
         "_source_book": market.get("_source_book"),
         "_selection_for_validation": sel,
         "_price_is_stale_midprice": bool(market.get("_price_is_stale_midprice")),
+        "_event_url": market.get("_event_url", ""),
     }
     return index_key, sel, price_entry
 
@@ -1793,6 +1878,7 @@ def _build_cross_source_per_line_index(
         "bovada":     "Bovada",
         "kalshi":     "Kalshi",
         "polymarket": "Polymarket",
+        "novig":      "Novig",
     }
     for source_key, book_label in _BOOK_LABELS.items():
         for market in consolidated.get("books", {}).get(source_key) or []:
@@ -1915,6 +2001,7 @@ def _run_cross_source_arb_for_event(
                     "book":        entry["book"],
                     "odds_am":     entry["price_am"],
                     "updated_at":  entry.get("updated_at"),
+                    "url":         entry.get("_event_url", ""),
                 })
 
         side_a_list = sides.get(side_a_key) or []
@@ -1979,11 +2066,13 @@ def _run_cross_source_arb_for_event(
             "odds_a_am":    best_a["price_am"],
             "odds_a_dec":   dec_a,
             "updated_at_a": best_a.get("updated_at"),
+            "url_a":        best_a.get("_event_url", ""),
             "side_b":       side_b_key.capitalize(),
             "book_b":       best_b["book"],
             "odds_b_am":    best_b["price_am"],
             "odds_b_dec":   dec_b,
             "updated_at_b": best_b.get("updated_at"),
+            "url_b":        best_b.get("_event_url", ""),
             "arb_pct":      round(arb, 6),
             "profit":       profit,
             "stake_a":      stake_a,
@@ -2008,6 +2097,7 @@ def _run_cross_source_arb_for_event(
                 "book":        entry["book"],
                 "odds_am":     entry["price_am"],
                 "updated_at":  entry.get("updated_at"),
+                "url":         entry.get("_event_url", ""),
             })
         for entry in away_plus:
             raw_lines.append({
@@ -2019,6 +2109,7 @@ def _run_cross_source_arb_for_event(
                 "book":        entry["book"],
                 "odds_am":     entry["price_am"],
                 "updated_at":  entry.get("updated_at"),
+                "url":         entry.get("_event_url", ""),
             })
 
         if not home_minus or not away_plus:
@@ -2062,11 +2153,13 @@ def _run_cross_source_arb_for_event(
             "odds_a_am":    best_home["price_am"],
             "odds_a_dec":   dec_h,
             "updated_at_a": best_home.get("updated_at"),
+            "url_a":        best_home.get("_event_url", ""),
             "side_b":       "Away",
             "book_b":       best_away["book"],
             "odds_b_am":    best_away["price_am"],
             "odds_b_dec":   dec_a,
             "updated_at_b": best_away.get("updated_at"),
+            "url_b":        best_away.get("_event_url", ""),
             "arb_pct":      round(arb, 6),
             "profit":       profit,
             "stake_a":      stake_h,
@@ -2084,12 +2177,15 @@ def _run_live_source_arbs(
     bovada_events: list[dict[str, Any]],
     kalshi_events: list[dict[str, Any]],
     poly_events: list[dict[str, Any]],
+    novig_events: list[dict[str, Any]] | None = None,
     match_threshold: int = 75,
 ) -> tuple[list[dict], list[dict], list[dict]]:
     """
-    Detect arbs across live sources directly (Bovada/Kalshi/Polymarket),
+    Detect arbs across live sources directly (Bovada/Kalshi/Polymarket/Novig),
     without requiring a TheRundown anchor event.
     """
+    if novig_events is None:
+        novig_events = []
     fetch_ts = datetime.now(timezone.utc).isoformat()
     all_arbs: list[dict] = []
     all_lines: list[dict] = []
@@ -2117,6 +2213,7 @@ def _run_live_source_arbs(
 
     all_live = (
         _to_matchable(bovada_events, "bovada")
+        + _to_matchable(novig_events or [], "novig")
         + _to_matchable(kalshi_events, "kalshi")
         + _to_matchable(poly_events, "polymarket")
     )
@@ -2162,7 +2259,7 @@ def _run_live_source_arbs(
 
     for cluster in clusters:
         anchor_evt = cluster[0]
-        books_dict: dict[str, list[dict]] = {"bovada": [], "kalshi": [], "polymarket": []}
+        books_dict: dict[str, list[dict]] = {"bovada": [], "kalshi": [], "polymarket": [], "novig": []}
         for member in cluster:
             src = str(member.get("_source") or "")
             if src in books_dict:
@@ -2258,11 +2355,16 @@ async def handle_scan_now(request: web.Request) -> web.Response:
 
         pm_task = asyncio.wait_for(
             prediction_markets.fetch_all_prediction_markets(sport_keys),
-            timeout=30.0,
+            timeout=60.0,
         )
 
-        rundown_result, bovada_result, pm_result = await asyncio.gather(
-            rundown_task, bovada_task, pm_task, return_exceptions=True,
+        novig_task = asyncio.wait_for(
+            _fetch_novig_events_for_sports(selected_names),
+            timeout=15.0,
+        )
+
+        rundown_result, bovada_result, pm_result, novig_result = await asyncio.gather(
+            rundown_task, bovada_task, pm_task, novig_task, return_exceptions=True,
         )
 
         if isinstance(pm_result, Exception):
@@ -2280,7 +2382,7 @@ async def handle_scan_now(request: web.Request) -> web.Response:
 
                 if kalshi_future is not None:
                     try:
-                        kalshi_events = kalshi_future.result(timeout=12) or []
+                        kalshi_events = kalshi_future.result(timeout=30) or []
                     except Exception as e:
                         print(f"KALSHI_WARN: {e}")
                         kalshi_events = []
@@ -2298,7 +2400,8 @@ async def handle_scan_now(request: web.Request) -> web.Response:
             f"SOURCES: TheRundown=ok  "
             f"Bovada={'ok' if not isinstance(bovada_result, Exception) else 'FAIL'}  "
             f"Kalshi={len(kalshi_events)} events  "
-            f"Polymarket={len(poly_events)} events"
+            f"Polymarket={len(poly_events)} events  "
+            f"Novig={'ok' if not isinstance(novig_result, Exception) else 'FAIL'}"
         )
 
         # ── Step 2: Unpack fetched results independently ───────────────
@@ -2318,11 +2421,24 @@ async def handle_scan_now(request: web.Request) -> web.Response:
 
         pm_error: str | None = "; ".join(pm_errors) if pm_errors else None
 
+        novig_events: list[dict[str, Any]] = []
+        if isinstance(novig_result, Exception):
+            logger.warning("Novig scan failed: %s", novig_result)
+        else:
+            novig_events = novig_result or []
+
+        # Tag every market dict with its parent event_url (idempotent).
+        _tag_markets_with_event_url(bovada_events)
+        _tag_markets_with_event_url(kalshi_events)
+        _tag_markets_with_event_url(poly_events)
+        _tag_markets_with_event_url(novig_events)
+
         # ── Step 3: Live-source-only arbs (no TheRundown dependency) ───
         live_arbs, live_lines, live_best = _run_live_source_arbs(
             bovada_events=bovada_events,
             kalshi_events=kalshi_events,
             poly_events=poly_events,
+            novig_events=novig_events,
         )
 
         # ── Step 4: Combined pool with TheRundown as extra book ────────
@@ -2332,6 +2448,7 @@ async def handle_scan_now(request: web.Request) -> web.Response:
             bovada_events=bovada_events,
             kalshi_events=kalshi_events,
             poly_events=poly_events,
+            novig_events=novig_events,
         )
         cross_arbs, cross_lines, cross_best = _run_arbs_on_pool(game_pool)
 
@@ -2359,7 +2476,7 @@ async def handle_scan_now(request: web.Request) -> web.Response:
             f"{len(cross_arbs)} combined arbs → "
             f"{len(state.arbs)} total (deduped) | "
             f"Kalshi:{len(kalshi_events)} Poly:{len(poly_events)} "
-            f"Bovada:{len(bovada_events)} events"
+            f"Bovada:{len(bovada_events)} Novig:{len(novig_events)} events"
         )
 
         return web.json_response(
@@ -2377,6 +2494,7 @@ async def handle_scan_now(request: web.Request) -> web.Response:
                     "bovada":     len(bovada_events),
                     "kalshi":     len(kalshi_events),
                     "polymarket": len(poly_events),
+                    "novig":      len(novig_events),
                 },
                 "bovadaError":  bovada_error,
                 "pmError":      pm_error,

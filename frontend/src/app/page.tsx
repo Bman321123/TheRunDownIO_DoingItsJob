@@ -2,12 +2,15 @@
 
 import { useEffect, useMemo, useState } from "react";
 import type { Arb, RawLine, BestLine, ScanNowResponse } from "@/lib/types";
+import Image from "next/image";
 import { ArbCard } from "@/components/ArbCard";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { UnderlineTabs } from "@/components/ui/underline-tabs";
 import { AnimatedTextReveal } from "@/components/ui/animated-text-reveal";
 import { Badge } from "@/components/ui/badge";
+import { espnTeamLogoUrl, initials, parseMatchup } from "@/lib/teams";
+import { buildDeepLink } from "@/lib/deeplinks";
 
 const DEFAULT_BASE = "http://127.0.0.1:3030";
 
@@ -286,6 +289,7 @@ export default function HomePage() {
                             <th className="font-medium pb-2">Market</th>
                             <th className="font-medium pb-2">Side</th>
                             <th className="font-medium text-right pb-2">American Odds</th>
+                            <th className="font-medium text-center pb-2 w-10"></th>
                           </tr>
                         </thead>
                         <tbody className="divide-y divide-border/70">
@@ -309,6 +313,19 @@ export default function HomePage() {
                               >
                                 {l.odds_am > 0 ? `+${l.odds_am}` : l.odds_am}
                               </td>
+                              <td className="py-2.5 px-2 text-center">
+                                <a
+                                  href={buildDeepLink(l.book, parseMatchup(l.game).home, l.url)}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  className="inline-flex items-center justify-center h-6 w-6 rounded text-sky-400 hover:bg-sky-500/20 transition"
+                                  title={`Open on ${l.book}`}
+                                >
+                                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" className="h-3.5 w-3.5">
+                                    <path fillRule="evenodd" d="M4.22 11.78a.75.75 0 0 1 0-1.06L9.44 5.5H5.75a.75.75 0 0 1 0-1.5h5.5a.75.75 0 0 1 .75.75v5.5a.75.75 0 0 1-1.5 0V6.56l-5.22 5.22a.75.75 0 0 1-1.06 0Z" clipRule="evenodd" />
+                                  </svg>
+                                </a>
+                              </td>
                             </tr>
                           ))}
                         </tbody>
@@ -328,19 +345,48 @@ export default function HomePage() {
               No eligible markets found for the current scan. Try scanning again or adjusting sports selection.
             </Card>
           ) : (
-            Array.from(
-              bestLines.reduce((acc, bl) => {
-                const key = `${bl.sport}::${bl.game}`;
-                const list = acc.get(key) ?? [];
-                list.push(bl);
-                acc.set(key, list);
-                return acc;
-              }, new Map<string, BestLine[]>())
-            )
-              .map(([key, linesForEvent]) => {
-                return { key, linesForEvent };
-              })
-              .sort((a, b) => a.key.localeCompare(b.key))
+            (() => {
+              // Hoist arb value calculation so we can sort by it
+              const _amToDec = (am: number) =>
+                am >= 100 ? am / 100 + 1 : am <= -100 ? 100 / Math.abs(am) + 1 : 0;
+              const _bestArbValue = (lines: BestLine[]): number => {
+                let best = -Infinity;
+                for (const bl of lines) {
+                  // Moneyline pair value
+                  if (bl.type === "moneyline" && bl.home?.odds_am != null && bl.away?.odds_am != null) {
+                    const dA = _amToDec(bl.home.odds_am);
+                    const dB = _amToDec(bl.away.odds_am);
+                    if (dA > 1 && dB > 1) {
+                      const v = Math.round((1 - (1 / dA + 1 / dB)) * 10000) / 100;
+                      if (v > best) best = v;
+                    }
+                  }
+                  // Total pair value
+                  if (bl.type === "total" && bl.over?.odds_am != null && bl.under?.odds_am != null) {
+                    const dA = _amToDec(bl.over.odds_am);
+                    const dB = _amToDec(bl.under.odds_am);
+                    if (dA > 1 && dB > 1) {
+                      const v = Math.round((1 - (1 / dA + 1 / dB)) * 10000) / 100;
+                      if (v > best) best = v;
+                    }
+                  }
+                }
+                return best === -Infinity ? -999 : best;
+              };
+              return Array.from(
+                bestLines.reduce((acc, bl) => {
+                  const key = `${bl.sport}::${bl.game}`;
+                  const list = acc.get(key) ?? [];
+                  list.push(bl);
+                  acc.set(key, list);
+                  return acc;
+                }, new Map<string, BestLine[]>())
+              )
+                .map(([key, linesForEvent]) => {
+                  return { key, linesForEvent, _val: _bestArbValue(linesForEvent) };
+                })
+                .sort((a, b) => b._val - a._val || a.key.localeCompare(b.key));
+            })()
               .map(({ key, linesForEvent }) => {
               const [sport, game] = key.split("::");
               const ml = linesForEvent.filter((l) => l.type === "moneyline");
@@ -366,6 +412,18 @@ export default function HomePage() {
                 if (lower.includes("hard rock") || lower.includes("hardrock")) return "HRB";
                 return name;
               };
+              const bookBadge = (bookName: string, teamName: string, url?: string, size: "sm" | "md" = "sm") => {
+                const link = buildDeepLink(bookName, teamName, url);
+                const cls = size === "sm"
+                  ? "rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-semibold text-primary hover:bg-sky-500/20 hover:text-sky-400 transition"
+                  : "rounded-full bg-muted px-2 py-0.5 text-xs font-semibold text-primary hover:bg-sky-500/20 hover:text-sky-400 transition";
+                return (
+                  <a href={link} target="_blank" rel="noopener noreferrer" className={cls}>
+                    {shortBook(bookName)}
+                  </a>
+                );
+              };
+
               const formatOdds = (v: number | undefined | null) => {
                 if (v == null) return "—";
                 return v > 0 ? `+${v}` : `${v}`;
@@ -432,37 +490,76 @@ export default function HomePage() {
                       if (!bl.home || !bl.away || !bl.home_team || !bl.away_team) return null;
                       if (bl.home.odds_am == null || bl.away.odds_am == null) return null;
                       const mlVal = pairValue(bl.home.odds_am, bl.away.odds_am);
+                      const homeLogoUrl = espnTeamLogoUrl(sport, bl.home_team);
+                      const awayLogoUrl = espnTeamLogoUrl(sport, bl.away_team);
+                      const linkHome = buildDeepLink(bl.home.book, bl.home_team!, bl.home.url);
+                      const linkAway = buildDeepLink(bl.away.book, bl.away_team!, bl.away.url);
+                      const handlePlaceBothML = () => {
+                        window.open(linkHome, "_blank", "noopener,noreferrer");
+                        setTimeout(() => window.open(linkAway, "_blank", "noopener,noreferrer"), 100);
+                      };
                       return (
                         <div key={`ml-${idx}`} className="mt-3">
-                          <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                          <div className="flex gap-2">
+                          <div className="flex-1 grid grid-cols-1 gap-2 sm:grid-cols-2">
                             <div className="flex items-center justify-between rounded-xl bg-overlay px-4 py-3">
-                              <div>
-                                <div className="text-[10px] uppercase tracking-wider text-secondary">Home</div>
-                                <div className="text-sm font-bold text-primary">{bl.home_team}</div>
+                              <div className="flex items-center gap-2.5">
+                                <div className="relative h-8 w-8 shrink-0 overflow-hidden rounded-full border border-border bg-surface">
+                                  {homeLogoUrl ? (
+                                    <Image src={homeLogoUrl} alt={bl.home_team} fill sizes="32px" />
+                                  ) : (
+                                    <div className="grid h-full w-full place-items-center text-[10px] font-bold text-secondary">
+                                      {initials(bl.home_team)}
+                                    </div>
+                                  )}
+                                </div>
+                                <div>
+                                  <div className="text-[10px] uppercase tracking-wider text-secondary">Home</div>
+                                  <div className="text-sm font-bold text-primary">{bl.home_team}</div>
+                                </div>
                               </div>
                               <div className="flex items-center gap-2">
                                 <span className={`font-mono text-lg font-bold ${oddsColor(bl.home.odds_am)}`}>
                                   {formatOdds(bl.home.odds_am)}
                                 </span>
-                                <span className="rounded-full bg-muted px-2 py-0.5 text-xs font-semibold text-primary">
-                                  {shortBook(bl.home.book)}
-                                </span>
+                                {bookBadge(bl.home.book, bl.home_team!, bl.home.url, "md")}
                               </div>
                             </div>
                             <div className="flex items-center justify-between rounded-xl bg-overlay px-4 py-3">
-                              <div>
-                                <div className="text-[10px] uppercase tracking-wider text-secondary">Away</div>
-                                <div className="text-sm font-bold text-primary">{bl.away_team}</div>
+                              <div className="flex items-center gap-2.5">
+                                <div className="relative h-8 w-8 shrink-0 overflow-hidden rounded-full border border-border bg-surface">
+                                  {awayLogoUrl ? (
+                                    <Image src={awayLogoUrl} alt={bl.away_team} fill sizes="32px" />
+                                  ) : (
+                                    <div className="grid h-full w-full place-items-center text-[10px] font-bold text-secondary">
+                                      {initials(bl.away_team)}
+                                    </div>
+                                  )}
+                                </div>
+                                <div>
+                                  <div className="text-[10px] uppercase tracking-wider text-secondary">Away</div>
+                                  <div className="text-sm font-bold text-primary">{bl.away_team}</div>
+                                </div>
                               </div>
                               <div className="flex items-center gap-2">
                                 <span className={`font-mono text-lg font-bold ${oddsColor(bl.away.odds_am)}`}>
                                   {formatOdds(bl.away.odds_am)}
                                 </span>
-                                <span className="rounded-full bg-muted px-2 py-0.5 text-xs font-semibold text-primary">
-                                  {shortBook(bl.away.book)}
-                                </span>
+                                {bookBadge(bl.away.book, bl.away_team!, bl.away.url, "md")}
                               </div>
                             </div>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={handlePlaceBothML}
+                            className="flex flex-col items-center justify-center gap-2 rounded-lg bg-sky-500/15 border border-sky-500/30 px-3 min-w-[52px] text-sky-400 hover:bg-sky-500/25 hover:border-sky-400/50 transition-all cursor-pointer group"
+                          >
+                            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="h-5 w-5 group-hover:scale-110 transition-transform">
+                              <path fillRule="evenodd" d="M4.25 5.5a.75.75 0 0 0-.75.75v8.5c0 .414.336.75.75.75h8.5a.75.75 0 0 0 .75-.75v-4a.75.75 0 0 1 1.5 0v4A2.25 2.25 0 0 1 12.75 17h-8.5A2.25 2.25 0 0 1 2 14.75v-8.5A2.25 2.25 0 0 1 4.25 4h5a.75.75 0 0 1 0 1.5h-5Z" clipRule="evenodd" />
+                              <path fillRule="evenodd" d="M6.194 12.753a.75.75 0 0 0 1.06.053L16.5 4.44v2.81a.75.75 0 0 0 1.5 0v-4.5a.75.75 0 0 0-.75-.75h-4.5a.75.75 0 0 0 0 1.5h2.553l-9.056 8.194a.75.75 0 0 0-.053 1.06Z" clipRule="evenodd" />
+                            </svg>
+                            <span className="text-[10px] font-bold uppercase tracking-wider [writing-mode:vertical-lr] rotate-180">Place Bets</span>
+                          </button>
                           </div>
                           {!spreadsOpen && !totalsOpen && mlVal != null && (
                             <div className="mt-1.5 flex items-center gap-2 text-[10px] text-muted-text">
@@ -565,9 +662,7 @@ export default function HomePage() {
                                       <span className={`font-mono text-sm font-semibold ${oddsColor(homeNeg!.pick!.odds_am)}`}>
                                         {formatOdds(homeNeg!.pick!.odds_am)}
                                       </span>
-                                      <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-semibold text-primary">
-                                        {shortBook(homeNeg!.pick!.book)}
-                                      </span>
+                                      {bookBadge(homeNeg!.pick!.book, homeName, homeNeg!.pick!.url)}
                                     </div>
                                   </div>
                                   <div className="flex items-center justify-between rounded-lg bg-overlay px-3 py-1.5">
@@ -581,9 +676,7 @@ export default function HomePage() {
                                       <span className={`font-mono text-sm font-semibold ${oddsColor(awayPos!.pick!.odds_am)}`}>
                                         {formatOdds(awayPos!.pick!.odds_am)}
                                       </span>
-                                      <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-semibold text-primary">
-                                        {shortBook(awayPos!.pick!.book)}
-                                      </span>
+                                      {bookBadge(awayPos!.pick!.book, awayName, awayPos!.pick!.url)}
                                     </div>
                                   </div>
                                 </div>
@@ -609,9 +702,7 @@ export default function HomePage() {
                                       <span className={`font-mono text-sm font-semibold ${oddsColor(homePos!.pick!.odds_am)}`}>
                                         {formatOdds(homePos!.pick!.odds_am)}
                                       </span>
-                                      <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-semibold text-primary">
-                                        {shortBook(homePos!.pick!.book)}
-                                      </span>
+                                      {bookBadge(homePos!.pick!.book, homeName, homePos!.pick!.url)}
                                     </div>
                                   </div>
                                   <div className="flex items-center justify-between rounded-lg bg-overlay px-3 py-1.5">
@@ -625,9 +716,7 @@ export default function HomePage() {
                                       <span className={`font-mono text-sm font-semibold ${oddsColor(awayNeg!.pick!.odds_am)}`}>
                                         {formatOdds(awayNeg!.pick!.odds_am)}
                                       </span>
-                                      <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-semibold text-primary">
-                                        {shortBook(awayNeg!.pick!.book)}
-                                      </span>
+                                      {bookBadge(awayNeg!.pick!.book, awayName, awayNeg!.pick!.url)}
                                     </div>
                                   </div>
                                 </div>
@@ -669,18 +758,14 @@ export default function HomePage() {
                                   <span className={`font-mono ${oddsColor(bl.over.odds_am)}`}>
                                     {formatOdds(bl.over.odds_am)}
                                   </span>
-                                  <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-semibold text-primary">
-                                    {shortBook(bl.over.book)}
-                                  </span>
+                                  {bookBadge(bl.over.book, homeName, bl.over.url)}
                                 </div>
                                 <div className="flex items-center gap-1.5">
                                   <span className="text-[10px] text-secondary">U</span>
                                   <span className={`font-mono ${oddsColor(bl.under.odds_am)}`}>
                                     {formatOdds(bl.under.odds_am)}
                                   </span>
-                                  <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-semibold text-primary">
-                                    {shortBook(bl.under.book)}
-                                  </span>
+                                  {bookBadge(bl.under.book, homeName, bl.under.url)}
                                 </div>
                               </div>
                             </div>
@@ -721,18 +806,14 @@ export default function HomePage() {
                                   <span className={`font-mono ${oddsColor(bl.over.odds_am)}`}>
                                     {formatOdds(bl.over.odds_am)}
                                   </span>
-                                  <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-semibold text-primary">
-                                    {shortBook(bl.over.book)}
-                                  </span>
+                                  {bookBadge(bl.over.book, homeName, bl.over.url)}
                                 </div>
                                 <div className="flex items-center gap-1.5">
                                   <span className="text-[10px] text-secondary">U</span>
                                   <span className={`font-mono ${oddsColor(bl.under.odds_am)}`}>
                                     {formatOdds(bl.under.odds_am)}
                                   </span>
-                                  <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-semibold text-primary">
-                                    {shortBook(bl.under.book)}
-                                  </span>
+                                  {bookBadge(bl.under.book, homeName, bl.under.url)}
                                 </div>
                               </div>
                             </div>

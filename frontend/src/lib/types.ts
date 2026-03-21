@@ -8,11 +8,13 @@ export type Arb = {
   book_a: string;
   odds_a_am: number;
   updated_at_a?: string | number | null;
+  url_a?: string;
 
   side_b: string;
   book_b: string;
   odds_b_am: number;
   updated_at_b?: string | number | null;
+  url_b?: string;
 
   profit: number;
   stake_a: number;
@@ -33,6 +35,7 @@ export type RawLine = {
   book: string;
   odds_am: number;
   updated_at?: string | number | null;
+  url?: string;
 };
 
 export type BestLine = {
@@ -47,24 +50,29 @@ export type BestLine = {
   home?: {
     book: string;
     odds_am: number;
+    url?: string;
   };
   away?: {
     book: string;
     odds_am: number;
+    url?: string;
   };
   over?: {
     book: string;
     odds_am: number;
+    url?: string;
   };
   under?: {
     book: string;
     odds_am: number;
+    url?: string;
   };
   side?: "home" | "away" | string;
   team?: string;
   pick?: {
     book: string;
     odds_am: number;
+    url?: string;
   };
 };
 
