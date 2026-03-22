@@ -157,6 +157,17 @@ def _resolve_executable_yes_ask(
     return _safe_float(market.get("yes_ask"))
 
 
+def _resolve_no_ask(market: dict[str, Any]) -> float | None:
+    """
+    Resolve the NO ask price directly from the Kalshi API.
+
+    The API provides `no_ask_dollars` as a first-class field.
+    We do NOT derive it from yes_bid (1 - yes_bid) because the
+    bid-ask spread makes that inaccurate.
+    """
+    return _safe_float(market.get("no_ask_dollars"))
+
+
 def fetch_kalshi_markets(sport_keys: list[str] | None = None) -> list[dict[str, Any]]:
     """
     Returns a list of event-like dicts, one per unique game found:
@@ -268,12 +279,20 @@ def _parse_event(raw: dict, orderbook_cache: dict[str, float | None]) -> dict[st
     am_a, dec_a = odds_a
     am_b, dec_b = odds_b
 
+    # ── Also extract NO ask prices directly from the API ─────────────
+    no_price_a = _resolve_no_ask(sub_a)
+    no_price_b = _resolve_no_ask(sub_b)
+    no_odds_a = _dollars_to_odds(no_price_a) if no_price_a is not None else None
+    no_odds_b = _dollars_to_odds(no_price_b) if no_price_b is not None else None
+
     home_am: int
     away_am: int
     home_dec: float
     away_dec: float
     home_team: str
     away_team: str
+    # Track which sub-market maps to home for NO price assignment
+    home_is_a: bool = True  # default
 
     if parsed is not None:
         away_raw, home_raw = parsed
@@ -281,18 +300,22 @@ def _parse_event(raw: dict, orderbook_cache: dict[str, float | None]) -> dict[st
             home_team, away_team = name_a or home_raw, name_b or away_raw
             home_am, away_am = am_a, am_b
             home_dec, away_dec = dec_a, dec_b
+            home_is_a = True
         elif _name_matches(name_b, home_raw):
             home_team, away_team = name_b or home_raw, name_a or away_raw
             home_am, away_am = am_b, am_a
             home_dec, away_dec = dec_b, dec_a
+            home_is_a = False
         elif _name_matches(name_a, away_raw):
             home_team, away_team = name_b or home_raw, name_a or away_raw
             home_am, away_am = am_b, am_a
             home_dec, away_dec = dec_b, dec_a
+            home_is_a = False
         elif _name_matches(name_b, away_raw):
             home_team, away_team = name_a or home_raw, name_b or away_raw
             home_am, away_am = am_a, am_b
             home_dec, away_dec = dec_a, dec_b
+            home_is_a = True
         else:
             # Also try matching sub-market tickers against title team names
             ticker_a = (sub_a.get("ticker") or "").lower()
@@ -303,10 +326,12 @@ def _parse_event(raw: dict, orderbook_cache: dict[str, float | None]) -> dict[st
                 home_team, away_team = name_a or home_raw, name_b or away_raw
                 home_am, away_am = am_a, am_b
                 home_dec, away_dec = dec_a, dec_b
+                home_is_a = True
             elif any(tok in ticker_b for tok in home_low.split() if len(tok) > 2) or home_low in ticker_b:
                 home_team, away_team = name_b or home_raw, name_a or away_raw
                 home_am, away_am = am_b, am_a
                 home_dec, away_dec = dec_b, dec_a
+                home_is_a = False
             else:
                 # Cannot reliably determine home/away — skip rather than guess
                 print(f"KALSHI_SKIP: cannot match sub-markets to teams. title={title!r}, "
@@ -330,32 +355,91 @@ def _parse_event(raw: dict, orderbook_cache: dict[str, float | None]) -> dict[st
     else:
         event_url = "https://kalshi.com/browse/sports"
 
+    # ── Extract start_time from sub-market expected_expiration_time ──
+    start_time: str | None = None
+    for m in active:
+        exp = m.get("expected_expiration_time")
+        if exp:
+            start_time = str(exp)
+            break
+
     now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+    # ── Build markets list: YES contracts for both sides ─────────────
+    markets_list = [
+        {
+            "market_type": "moneyline",
+            "selection": "home",
+            "affiliate_name": "Kalshi",
+            "american_odds": home_am,
+            "decimal_odds": home_dec,
+            "line_value": None,
+            "updated_at": now,
+            "_contract_type": "YES",
+            "_selection_for_validation": "home",
+        },
+        {
+            "market_type": "moneyline",
+            "selection": "away",
+            "affiliate_name": "Kalshi",
+            "american_odds": away_am,
+            "decimal_odds": away_dec,
+            "line_value": None,
+            "updated_at": now,
+            "_contract_type": "YES",
+            "_selection_for_validation": "away",
+        },
+    ]
+
+    # ── Add NO contracts as separate market entries ──────────────────
+    # Buying NO on home team = covers "away wins" outcome
+    # Buying NO on away team = covers "home wins" outcome
+    #
+    # NO on home sub-market → pays when home loses → same outcome as "away"
+    # NO on away sub-market → pays when away loses → same outcome as "home"
+    #
+    # We label NO contracts with the OUTCOME they cover (the opposite team),
+    # and mark _contract_type="NO" so the arb engine can validate combos.
+    home_no_odds = no_odds_a if home_is_a else no_odds_b
+    away_no_odds = no_odds_b if home_is_a else no_odds_a
+
+    if home_no_odds is not None:
+        no_home_am, no_home_dec = home_no_odds
+        # NO on home team → pays when away wins → covers "away" outcome
+        markets_list.append({
+            "market_type": "moneyline",
+            "selection": "away",
+            "affiliate_name": "Kalshi",
+            "american_odds": no_home_am,
+            "decimal_odds": no_home_dec,
+            "line_value": None,
+            "updated_at": now,
+            "_contract_type": "NO",
+            "_selection_for_validation": "home",
+        })
+
+    if away_no_odds is not None:
+        no_away_am, no_away_dec = away_no_odds
+        # NO on away team → pays when home wins → covers "home" outcome
+        markets_list.append({
+            "market_type": "moneyline",
+            "selection": "home",
+            "affiliate_name": "Kalshi",
+            "american_odds": no_away_am,
+            "decimal_odds": no_away_dec,
+            "line_value": None,
+            "updated_at": now,
+            "_contract_type": "NO",
+            "_selection_for_validation": "away",
+        })
+
     return {
         "home_team": home_team,
         "away_team": away_team,
         "source": "kalshi",
         "event_url": event_url,
-        "markets": [
-            {
-                "market_type": "moneyline",
-                "selection": "home",
-                "affiliate_name": "Kalshi",
-                "american_odds": home_am,
-                "decimal_odds": home_dec,
-                "line_value": None,
-                "updated_at": now,
-            },
-            {
-                "market_type": "moneyline",
-                "selection": "away",
-                "affiliate_name": "Kalshi",
-                "american_odds": away_am,
-                "decimal_odds": away_dec,
-                "line_value": None,
-                "updated_at": now,
-            },
-        ],
+        "start_time": start_time,
+        "markets": markets_list,
     }
 
 

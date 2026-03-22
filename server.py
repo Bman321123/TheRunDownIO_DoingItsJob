@@ -1268,7 +1268,39 @@ def _merge_best_lines(sources: list[list[dict[str, Any]]]) -> list[dict[str, Any
                         existing["under"] = _best_of(existing.get("under"), bl.get("under"))
                         existing["game"] = canonical_game
 
-    return list(ml_map.values()) + list(spread_map.values()) + list(total_map.values()) + list(prop_map.values())
+    # ── Sanity filter: reject moneyline entries with impossible implied
+    #    probability.  For any valid moneyline, the sum of implied
+    #    probabilities must be ≥ 1.0 (= 1.0 for fair, > 1.0 with vig).
+    #    When both sides show big positive odds, the sum drops well below
+    #    1.0, which is mathematically impossible and means prices from
+    #    different teams were mixed up. ──
+    def _implied_prob(american: int | float) -> float:
+        """Convert American odds to implied probability."""
+        am = float(american)
+        if am > 0:
+            return 100.0 / (am + 100.0)
+        else:
+            return abs(am) / (abs(am) + 100.0)
+
+    sane_ml: list[dict[str, Any]] = []
+    for entry in ml_map.values():
+        home_info = entry.get("home")
+        away_info = entry.get("away")
+        if home_info and away_info:
+            h_am = home_info.get("odds_am")
+            a_am = away_info.get("odds_am")
+            if isinstance(h_am, (int, float)) and isinstance(a_am, (int, float)):
+                ip_sum = _implied_prob(h_am) + _implied_prob(a_am)
+                if ip_sum < 0.90:
+                    print(
+                        f"  BEST_LINES_REJECT: implied prob sum={ip_sum:.3f} < 0.90 — "
+                        f"{entry.get('game', '?')} home={int(h_am):+d} ({home_info.get('book','?')}) "
+                        f"away={int(a_am):+d} ({away_info.get('book','?')}). Dropping."
+                    )
+                    continue
+        sane_ml.append(entry)
+
+    return sane_ml + list(spread_map.values()) + list(total_map.values()) + list(prop_map.values())
 
 
 def _kalshi_prices_are_plausible(
@@ -1559,11 +1591,44 @@ def _inject_matching_markets(
     best_markets: list[dict] = []
     best_swapped = False
 
+    # ── Start-time guard ─────────────────────────────────────────────
+    _MAX_DIFF_S = 12 * 3600
+    bucket_st_raw = bucket.get("start_time")
+    bucket_st: datetime | None = None
+    if bucket_st_raw:
+        try:
+            if isinstance(bucket_st_raw, (int, float)):
+                ts = float(bucket_st_raw)
+                if ts > 1e10:
+                    ts /= 1000
+                bucket_st = datetime.fromtimestamp(ts, tz=timezone.utc)
+            else:
+                bucket_st = datetime.fromisoformat(str(bucket_st_raw).replace("Z", "+00:00"))
+        except Exception:
+            pass
+
     for src in source_events:
         sh = _norm(src.get("home_team") or "")
         sa = _norm(src.get("away_team") or "")
         if not sh or not sa:
             continue
+
+        # ── Start-time guard: skip if start_times differ by > 12h ────
+        if bucket_st is not None:
+            src_st_raw = src.get("start_time")
+            if src_st_raw:
+                try:
+                    if isinstance(src_st_raw, (int, float)):
+                        ts2 = float(src_st_raw)
+                        if ts2 > 1e10:
+                            ts2 /= 1000
+                        src_st = datetime.fromtimestamp(ts2, tz=timezone.utc)
+                    else:
+                        src_st = datetime.fromisoformat(str(src_st_raw).replace("Z", "+00:00"))
+                    if abs((bucket_st - src_st).total_seconds()) > _MAX_DIFF_S:
+                        continue
+                except Exception:
+                    pass
 
         score_normal  = min(_team_match_score(rd_home, sh), _team_match_score(rd_away, sa))
         score_swapped = min(_team_match_score(rd_home, sa), _team_match_score(rd_away, sh))
@@ -1589,9 +1654,24 @@ def _inject_matching_markets(
         sb_home_am: int | None = None
         sb_away_am: int | None = None
         raw_evt = bucket.get("_enriched_event") or {}
+
+        # Resolve home/away team names for name-based participant matching
+        # (TheRundown participant ordering is NOT guaranteed).
+        _rd_home_lc = rd_home.lower().strip()
+        _rd_away_lc = rd_away.lower().strip()
+
         for mkt in (raw_evt.get("markets") or []):
             if mkt.get("market_id") == 1 and mkt.get("period_id") == 0:
                 for idx, p in enumerate(mkt.get("participants") or []):
+                    pname = (p.get("name") or "").lower().strip()
+                    # Determine side by name matching first, then idx fallback
+                    if _rd_home_lc and (_rd_home_lc in pname or pname in _rd_home_lc):
+                        side = "home"
+                    elif _rd_away_lc and (_rd_away_lc in pname or pname in _rd_away_lc):
+                        side = "away"
+                    else:
+                        side = "away" if idx == 0 else "home"
+
                     prices = (p.get("lines") or [{}])[0].get("prices") or {}
                     for book_id_str, price_obj in prices.items():
                         try:
@@ -1599,7 +1679,7 @@ def _inject_matching_markets(
                             book_name = therundown.KNOWN_BOOKS.get(src_book_id, "")
                             if book_name.lower() in ("betmgm", "draftkings", "fanduel"):
                                 am = int(price_obj.get("price", 0))
-                                if idx == 0:
+                                if side == "away":
                                     sb_away_am = am
                                 else:
                                     sb_home_am = am
@@ -1735,6 +1815,81 @@ def _run_arbs_on_pool(
     return all_arbs, all_lines, all_best
 
 
+def _source_events_to_raw_lines(
+    events: list[dict[str, Any]],
+    book_name: str,
+    sport_label: str,
+) -> list[dict]:
+    """
+    Convert raw source events (Kalshi/Polymarket/Bovada/Novig) directly into
+    raw_lines entries.  This guarantees ALL fetched data from every source
+    appears in the Raw Lines tab, even if the event didn't match a
+    TheRundown hub or form a live-source cluster.
+    """
+    lines: list[dict] = []
+    now_iso = datetime.now(timezone.utc).isoformat()
+    for evt in events:
+        home = evt.get("home_team") or "?"
+        away = evt.get("away_team") or "?"
+        game = f"{away} @ {home}"
+        evt_sport = str(evt.get("sport") or sport_label).upper()
+        for m in evt.get("markets") or []:
+            mtype = str(m.get("market_type") or "").lower()
+            sel = str(m.get("selection") or "").lower()
+            am = m.get("american_odds")
+            if am is None:
+                continue
+
+            if mtype == "moneyline":
+                kind = "ml"
+                line_label = "ML"
+            elif mtype == "spread":
+                kind = "spread"
+                lv = m.get("line_value")
+                line_label = f"{lv:g}" if lv is not None else ""
+            elif mtype == "total":
+                kind = "total"
+                lv = m.get("line_value")
+                line_label = f"{lv:g}" if lv is not None else ""
+            else:
+                continue
+
+            ct = m.get("_contract_type") or ""
+            display_book = f"{book_name} {ct}".strip() if ct else book_name
+
+            lines.append({
+                "sport":       evt_sport,
+                "game":        game,
+                "market_kind": kind,
+                "line_label":  line_label,
+                "side":        sel.capitalize(),
+                "book":        display_book,
+                "odds_am":     am,
+                "updated_at":  m.get("updated_at") or now_iso,
+                "url":         m.get("_event_url") or evt.get("event_url") or "",
+            })
+    return lines
+
+
+def _dedup_raw_lines(lines: list[dict]) -> list[dict]:
+    """Deduplicate raw lines by (game, book, market_kind, line_label, side, odds_am)."""
+    seen: set[tuple] = set()
+    result: list[dict] = []
+    for line in lines:
+        key = (
+            line.get("game", ""),
+            line.get("book", ""),
+            line.get("market_kind", ""),
+            line.get("line_label", ""),
+            line.get("side", ""),
+            line.get("odds_am"),
+        )
+        if key not in seen:
+            seen.add(key)
+            result.append(line)
+    return result
+
+
 def _dedup_arbs(arbs: list[dict]) -> list[dict]:
     """
     Deduplicate by (game, market_kind, line_label, {book_a, book_b}, {side_a, side_b}).
@@ -1847,7 +2002,13 @@ def _build_cross_source_per_line_index(
 
     def _add(index_key, side, entry):
         bucket = per_line.setdefault(index_key, {"home": [], "away": [], "over": [], "under": []})
-        if not any(e["book"] == entry["book"] for e in bucket.get(side, [])):
+        # Allow multiple entries from same book if contract types differ
+        # (e.g. Kalshi YES and Kalshi NO both contribute to the same side)
+        ct = entry.get("_contract_type") or ""
+        if not any(
+            e["book"] == entry["book"] and (e.get("_contract_type") or "") == ct
+            for e in bucket.get(side, [])
+        ):
             bucket[side].append(entry)
             kind, lv = index_key
             if kind == "spread" and lv is not None:
@@ -2218,6 +2379,93 @@ def _run_live_source_arbs(
         + _to_matchable(poly_events, "polymarket")
     )
 
+    # ── Helper: parse a start_time string into a UTC datetime ──────────
+    def _parse_start_time(val: Any) -> datetime | None:
+        if not val:
+            return None
+        try:
+            if isinstance(val, (int, float)):
+                ts = float(val)
+                if ts > 1e10:
+                    ts /= 1000
+                return datetime.fromtimestamp(ts, tz=timezone.utc)
+            return datetime.fromisoformat(str(val).replace("Z", "+00:00"))
+        except Exception:
+            return None
+
+    # ── Helper: check if two events' start_times are close enough ────
+    _MAX_START_TIME_DIFF_S = 12 * 3600  # 12 hours
+
+    def _start_times_compatible(a: dict, b: dict) -> bool:
+        st_a = _parse_start_time(a.get("start_time"))
+        st_b = _parse_start_time(b.get("start_time"))
+        if st_a is None or st_b is None:
+            return True  # allow when data missing
+        return abs((st_a - st_b).total_seconds()) <= _MAX_START_TIME_DIFF_S
+
+    # ── Helper: get the favorite direction for moneyline from markets ─
+    def _get_home_fav_direction(markets: list[dict]) -> bool | None:
+        home_am = None
+        away_am = None
+        for m in markets:
+            if m.get("market_type") == "moneyline":
+                sel = m.get("selection")
+                am = m.get("american_odds")
+                if sel == "home" and isinstance(am, (int, float)):
+                    home_am = am
+                elif sel == "away" and isinstance(am, (int, float)):
+                    away_am = am
+        if home_am is not None and away_am is not None:
+            return home_am < away_am  # True if home is favorite
+        return None
+
+    # ── Helper: plausibility-check PM markets against sportsbook ref ──
+    _PM_SOURCES = frozenset({"kalshi", "polymarket"})
+    _SB_SOURCES = frozenset({"bovada", "novig"})
+
+    def _apply_plausibility_corrections(cluster: list[dict[str, Any]]) -> None:
+        """
+        Within a cluster, compare prediction-market members against
+        sportsbook members.  If the PM favourite direction disagrees with
+        the sportsbook reference (spread > 150), flip the PM markets.
+        """
+        sb_direction: bool | None = None
+        for member in cluster:
+            if member.get("_source") in _SB_SOURCES:
+                d = _get_home_fav_direction(member.get("markets") or [])
+                if d is not None:
+                    sb_direction = d
+                    break
+        if sb_direction is None:
+            return
+
+        for member in cluster:
+            if member.get("_source") not in _PM_SOURCES:
+                continue
+            pm_direction = _get_home_fav_direction(member.get("markets") or [])
+            if pm_direction is None:
+                continue
+            if pm_direction != sb_direction:
+                # Check spread magnitude — only swap when it's clear-cut
+                home_am = next(
+                    (m.get("american_odds") for m in member.get("markets") or []
+                     if m.get("market_type") == "moneyline" and m.get("selection") == "home"),
+                    None,
+                )
+                if home_am is not None and abs(home_am) > 150:
+                    print(
+                        f"  LIVE_SWAP_DETECTED [{member.get('_source')}] "
+                        f"{member.get('home_team')} vs {member.get('away_team')}: "
+                        f"PM home_fav={pm_direction} vs SB home_fav={sb_direction}. Flipping."
+                    )
+                    flip = {"home": "away", "away": "home"}
+                    member["home_norm"], member["away_norm"] = member["away_norm"], member["home_norm"]
+                    member["home_team"], member["away_team"] = member["away_team"], member["home_team"]
+                    member["markets"] = [
+                        {**m, "selection": flip.get(m.get("selection"), m.get("selection"))}
+                        for m in member.get("markets") or []
+                    ]
+
     used: set[int] = set()
     clusters: list[list[dict[str, Any]]] = []
     for i, anchor in enumerate(all_live):
@@ -2230,6 +2478,11 @@ def _run_live_source_arbs(
                 continue
             if candidate.get("sport") != anchor.get("sport"):
                 continue
+
+            # ── Start-time guard: reject cross-date matches ──────────
+            if not _start_times_compatible(anchor, candidate):
+                continue
+
             score_direct = min(
                 _team_match_score(anchor["home_norm"], candidate["home_norm"]),
                 _team_match_score(anchor["away_norm"], candidate["away_norm"]),
@@ -2255,6 +2508,8 @@ def _run_live_source_arbs(
             cluster.append(candidate_adj)
             used.add(j)
         if len(cluster) > 1:
+            # ── Plausibility check: fix PM side-swaps vs sportsbook ──
+            _apply_plausibility_corrections(cluster)
             clusters.append(cluster)
 
     for cluster in clusters:
@@ -2463,9 +2718,20 @@ async def handle_scan_now(request: web.Request) -> web.Response:
         # ── Step 5: Merge, dedup, store ───────────────────────────────
         bovada_best_lines = _bovada_events_to_best_lines(bovada_events)
 
+        # Generate raw lines directly from ALL source events so every
+        # fetched line appears in the Raw Lines tab, regardless of matching.
+        sport_label = ",".join(selected_names)
+        source_raw_lines: list[dict] = []
+        source_raw_lines.extend(_source_events_to_raw_lines(kalshi_events, "Kalshi", sport_label))
+        source_raw_lines.extend(_source_events_to_raw_lines(poly_events, "Polymarket", sport_label))
+        source_raw_lines.extend(_source_events_to_raw_lines(bovada_events, "Bovada", sport_label))
+        source_raw_lines.extend(_source_events_to_raw_lines(novig_events, "Novig", sport_label))
+
         state.arbs       = _dedup_arbs(rd_arbs + live_arbs + cross_arbs)
         state.arbs.sort(key=lambda r: r.get("profit", 0), reverse=True)
-        state.lines      = rd_lines + live_lines + cross_lines
+        state.lines      = _dedup_raw_lines(
+            rd_lines + live_lines + cross_lines + source_raw_lines
+        )
         state.best_lines = _merge_best_lines([rd_best, bovada_best_lines, live_best, cross_best])
         state.last_scan_ms     = _now_ms()
         state.last_scan_sports = selected_names

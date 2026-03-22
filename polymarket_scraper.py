@@ -98,6 +98,10 @@ def _fetch_series_events(series_id: str) -> list[dict[str, Any]]:
         sub_markets = group.get("markets") or []
         parsed = _find_moneyline_market(group, sub_markets)
         if parsed:
+            # Carry endDate as start_time for cross-date matching guards
+            end_date = group.get("endDate") or group.get("end_date_iso")
+            if end_date:
+                parsed["start_time"] = str(end_date)
             results.append(parsed)
 
     return results
