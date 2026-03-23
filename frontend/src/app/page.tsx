@@ -22,6 +22,7 @@ export default function HomePage() {
   const baseUrl = process.env.NEXT_PUBLIC_ARBS_URL || DEFAULT_BASE;
   const arbsUrl = `${baseUrl.replace(/\/$/, "")}/arbs`;
   const scanUrl = `${baseUrl.replace(/\/$/, "")}/scan-now`;
+  const scanStreamUrl = `${baseUrl.replace(/\/$/, "")}/scan-now-stream`;
 
   const [selectedSports, setSelectedSports] = useState<Set<Sport>>(() => new Set(SPORTS));
   const [arbs, setArbs] = useState<Arb[]>([]);
@@ -101,21 +102,68 @@ export default function HomePage() {
     try {
       setScanStatus("scanning");
       setError(null);
-      const resp = await fetch(scanUrl, {
+
+      const resp = await fetch(scanStreamUrl, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ sports }),
       });
-      const payload = (await resp.json()) as ScanNowResponse;
-      if (!resp.ok || !payload?.ok) {
-        throw new Error(payload?.error || `HTTP ${resp.status}`);
+
+      if (!resp.ok || !resp.body) {
+        // Fallback to old endpoint if SSE not available
+        const fallback = await fetch(scanUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ sports }),
+        });
+        const payload = (await fallback.json()) as ScanNowResponse;
+        if (!fallback.ok || !payload?.ok) {
+          throw new Error(payload?.error || `HTTP ${fallback.status}`);
+        }
+        setArbs(Array.isArray(payload.arbs) ? payload.arbs : []);
+        setLines(Array.isArray(payload.lines) ? payload.lines : []);
+        setBestLines(Array.isArray(payload.bestLines) ? payload.bestLines : []);
+        setLastScannedMs(payload.lastScanMs ?? Date.now());
+        if (typeof payload.dataAge === "number") setDataAge(payload.dataAge);
+        if (payload.dpRemaining) setDpRemaining(payload.dpRemaining);
+        setScanStatus("idle");
+        return;
       }
-      setArbs(Array.isArray(payload.arbs) ? payload.arbs : []);
-      setLines(Array.isArray(payload.lines) ? payload.lines : []);
-      setBestLines(Array.isArray(payload.bestLines) ? payload.bestLines : []);
-      setLastScannedMs(payload.lastScanMs ?? Date.now());
-      if (typeof payload.dataAge === "number") setDataAge(payload.dataAge);
-      if (payload.dpRemaining) setDpRemaining(payload.dpRemaining);
+
+      // SSE streaming: read progressive updates
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        // Parse SSE events from buffer (split on double newline)
+        const parts = buffer.split("\n\n");
+        buffer = parts.pop()!; // keep incomplete chunk
+
+        for (const raw of parts) {
+          if (!raw.trim()) continue;
+          const dataLine = raw.split("\n").find((l) => l.startsWith("data: "));
+          if (!dataLine) continue;
+          try {
+            const payload = JSON.parse(dataLine.slice(6));
+            if (Array.isArray(payload.arbs)) setArbs(payload.arbs);
+            if (Array.isArray(payload.lines)) setLines(payload.lines);
+            if (Array.isArray(payload.bestLines)) setBestLines(payload.bestLines);
+            if (payload.lastScanMs) setLastScannedMs(payload.lastScanMs);
+            if (payload.sourceCounts) {
+              // sourceCounts available for display if needed
+            }
+            if (typeof payload.dataAge === "number") setDataAge(payload.dataAge);
+            if (payload.dpRemaining) setDpRemaining(payload.dpRemaining);
+          } catch {
+            // skip malformed SSE data
+          }
+        }
+      }
       setScanStatus("idle");
     } catch (e: any) {
       setScanStatus("error");

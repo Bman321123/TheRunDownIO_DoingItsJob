@@ -71,7 +71,8 @@ POLY_WORKERS    = 3
 CLOB_WORKERS    = 10
 
 # Polymarket CLOB: market depth minimum for a valid ask price
-CLOB_MIN_SIZE   = 1.0   # $1 minimum depth — below this treat as illiquid
+CLOB_MIN_SIZE   = 100.0  # $100 minimum depth — filter out illiquid/thin markets
+POLY_MIN_VOLUME = 10_000.0  # $10K minimum trading volume — filter zero-activity markets
 
 # Platform fee rates — applied to PROFIT, not settlement value
 #
@@ -1333,6 +1334,9 @@ def _parse_polymarket_event(raw: dict, sport: str, fetch_ts: str) -> dict | None
     if mtype is None:
         return None
 
+    # Extract trading volume for filtering (Gamma API includes this field)
+    raw_volume = _safe_float(raw.get("volume")) or 0.0
+
     # Outcomes / prices / tokens may be JSON strings or lists
     def _ensure_list(val):
         if isinstance(val, str):
@@ -1445,6 +1449,7 @@ def _parse_polymarket_event(raw: dict, sport: str, fetch_ts: str) -> dict | None
                 },
             ],
             "_raw_poly_id": raw.get("id"),
+            "_poly_volume": raw_volume,
         }
 
     elif mtype == "total":
@@ -1496,6 +1501,7 @@ def _parse_polymarket_event(raw: dict, sport: str, fetch_ts: str) -> dict | None
                     "_clob_token": token_b,
                 },
             ],
+            "_poly_volume": raw_volume,
         }
 
     elif mtype == "spread":
@@ -1762,8 +1768,25 @@ async def update_polymarket_clob_prices(events: list[dict]) -> list[dict]:
             )
             m["_price_is_stale_midprice"] = True
 
+    # Volume filter: exclude entire events with insufficient trading volume
+    volume_excluded = 0
+    for event in events:
+        raw_volume = float(event.get("_poly_volume", 0))
+        if raw_volume < POLY_MIN_VOLUME:
+            volume_excluded += 1
+            for m in event.get("markets") or []:
+                m["_price_is_stale_midprice"] = True
+            logger.debug(
+                "Polymarket %s vs %s: volume $%.0f < $%.0f minimum — excluding",
+                event.get("away_team", "?"), event.get("home_team", "?"),
+                raw_volume, POLY_MIN_VOLUME,
+            )
+
     updated = sum(1 for m in token_markets if m.get("_clob_updated"))
-    logger.info("Polymarket CLOB: updated %d/%d market prices", updated, len(token_markets))
+    logger.info(
+        "Polymarket CLOB: updated %d/%d market prices, %d events excluded (volume < $%.0f)",
+        updated, len(token_markets), volume_excluded, POLY_MIN_VOLUME,
+    )
     return events
 
 

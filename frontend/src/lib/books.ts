@@ -1,4 +1,4 @@
-export type BookKey = "draftkings" | "fanduel" | "betmgm" | "kalshi" | "polymarket" | "bovada" | "pinnacle" | "novig" | "unknown";
+export type BookKey = "draftkings" | "fanduel" | "betmgm" | "kalshi" | "polymarket" | "bovada" | "pinnacle" | "novig" | "og" | "unknown";
 
 export function normalizeBookName(name: string): BookKey {
   const n = (name || "").toLowerCase().replace(/\s+/g, "");
@@ -10,6 +10,7 @@ export function normalizeBookName(name: string): BookKey {
   if (n.includes("bovada") || n.includes("bodog")) return "bovada";
   if (n.includes("pinnacle")) return "pinnacle";
   if (n.includes("novig")) return "novig";
+  if (n === "og") return "og";
   return "unknown";
 }
 
@@ -23,6 +24,7 @@ export function bookLogoPath(bookName: string): string {
   if (key === "bovada") return "/books/bovada.svg";
   if (key === "pinnacle") return "/books/pinnacle.svg";
   if (key === "novig") return "/books/novig.svg";
+  if (key === "og") return "/books/og.svg";
   return "/books/book.svg";
 }
 

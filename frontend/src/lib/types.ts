@@ -111,10 +111,30 @@ export type ScanNowResponse = {
     bovada: number;
     kalshi: number;
     polymarket: number;
+    novig: number;
+    og: number;
   };
   bovadaError?: string | null;
   pmError?: string | null;
+  novigError?: string | null;
+  ogError?: string | null;
   error?: string;
+  dataAge?: number;
+  dpRemaining?: string;
+};
+
+export type ScanStreamEvent = {
+  phase: "fast" | "complete";
+  arbs?: Arb[];
+  lines?: RawLine[];
+  bestLines?: BestLine[];
+  sourceCounts?: Record<string, number>;
+  lastScanMs?: number;
+  matchedGames?: number;
+  bovadaError?: string | null;
+  pmError?: string | null;
+  novigError?: string | null;
+  ogError?: string | null;
   dataAge?: number;
   dpRemaining?: string;
 };

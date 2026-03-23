@@ -98,7 +98,7 @@ export function AppHeader() {
             variant="primary"
             className="ml-2 bg-accent-green text-[#0A0A0F] hover:bg-accent-green/90"
           >
-            <a href="http://127.0.0.1:3030/arbs" target="_blank" rel="noreferrer">
+            <a href="http://127.0.0.1:8888/arbs" target="_blank" rel="noreferrer">
               API
             </a>
           </Button>
@@ -149,7 +149,7 @@ export function AppHeader() {
                     variant="primary"
                     className="w-full bg-accent-green text-[#0A0A0F] hover:bg-accent-green/90"
                   >
-                    <a href="http://127.0.0.1:3030/arbs" target="_blank" rel="noreferrer">
+                    <a href="http://127.0.0.1:8888/arbs" target="_blank" rel="noreferrer">
                       API
                     </a>
                   </Button>

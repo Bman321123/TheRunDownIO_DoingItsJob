@@ -34,6 +34,8 @@ export function buildDeepLink(
       return "https://www.bovada.lv/sports";
     case "novig":
       return "https://novig.com/events";
+    case "og":
+      return "https://og.com";
     default:
       return "#";
   }
