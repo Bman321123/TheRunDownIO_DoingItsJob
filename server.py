@@ -675,6 +675,46 @@ def scan_arbs_once(sport_ids: list[int]) -> tuple[list[dict], list[dict], list[d
 # ──────────────────────────────────────────────
 # STATE + HANDLERS
 # ──────────────────────────────────────────────
+class _SourceCache:
+    """Keeps the last successful fetch for each data source.
+
+    When a source times out or errors on a scan cycle, we fall back to
+    its cached data so that results stay consistent across scans.
+    Entries expire after ``max_age_s`` seconds to avoid showing very
+    stale data.
+    """
+    def __init__(self, max_age_s: float = 120.0):
+        self._max_age_s = max_age_s
+        self._data: dict[str, tuple[list, float]] = {}   # name → (events, ts)
+
+    def put(self, name: str, events: list) -> None:
+        if events:  # only cache non-empty results
+            self._data[name] = (events, time.time())
+
+    def get(self, name: str) -> list:
+        entry = self._data.get(name)
+        if entry is None:
+            return []
+        events, ts = entry
+        if time.time() - ts > self._max_age_s:
+            return []  # stale — don't use
+        return events
+
+    def get_or(self, name: str, fresh: list) -> list:
+        """Return *fresh* if non-empty, else fall back to cache."""
+        if fresh:
+            self.put(name, fresh)
+            return fresh
+        cached = self.get(name)
+        if cached:
+            logger.info("Source %s failed — using cached data (%d events, %.0fs old)",
+                        name, len(cached), time.time() - self._data[name][1])
+        return cached
+
+
+_SOURCE_CACHE = _SourceCache(max_age_s=120.0)
+
+
 class ArbState:
     def __init__(self):
         self.arbs: list[dict] = []
@@ -3047,51 +3087,60 @@ async def handle_scan_now_stream(request: web.Request) -> web.StreamResponse:
         except Exception as e:
             pm_result = e
 
+        kalshi_fresh: list[dict[str, Any]] = []
+        poly_fresh: list[dict[str, Any]] = []
         if isinstance(pm_result, Exception):
             pm_errors.append(f"PredictionMarkets: {pm_result}")
         else:
-            kalshi_events, poly_events = pm_result
+            kalshi_fresh, poly_fresh = pm_result
 
         # Kalshi/Poly legacy fallback
-        need_kalshi = not kalshi_events
-        need_poly = not poly_events
+        need_kalshi = not kalshi_fresh
+        need_poly = not poly_fresh
         if (need_kalshi or need_poly) and sport_keys:
             with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
                 kalshi_future = pool.submit(fetch_kalshi_markets, sport_keys) if need_kalshi else None
                 poly_future   = pool.submit(fetch_polymarket_markets, sport_keys) if need_poly else None
                 if kalshi_future is not None:
                     try:
-                        kalshi_events = kalshi_future.result(timeout=30) or []
+                        kalshi_fresh = kalshi_future.result(timeout=30) or []
                     except Exception as e:
-                        kalshi_events = []
+                        kalshi_fresh = []
                         pm_errors.append(f"Kalshi legacy: {e}")
                 if poly_future is not None:
                     try:
-                        poly_events = poly_future.result(timeout=14) or []
+                        poly_fresh = poly_future.result(timeout=14) or []
                     except Exception as e:
-                        poly_events = []
+                        poly_fresh = []
                         pm_errors.append(f"Polymarket legacy: {e}")
 
+        # Use cached data if fresh fetch failed
+        kalshi_events = _SOURCE_CACHE.get_or("kalshi", kalshi_fresh)
+        poly_events = _SOURCE_CACHE.get_or("polymarket", poly_fresh)
+
         bovada_error: str | None = None
-        bovada_events: list[dict[str, Any]] = []
+        bovada_fresh: list[dict[str, Any]] = []
         try:
             bov_res = bovada_task.result()
-            bovada_events = bov_res or []
+            bovada_fresh = bov_res or []
         except Exception as e:
             bovada_error = str(e)
+        bovada_events = _SOURCE_CACHE.get_or("bovada", bovada_fresh)
 
-        novig_events: list[dict[str, Any]] = []
+        novig_fresh: list[dict[str, Any]] = []
         try:
-            novig_events = novig_task.result() or []
+            novig_fresh = novig_task.result() or []
         except Exception as e:
             logger.warning("Novig scan failed: %s", e)
+        novig_events = _SOURCE_CACHE.get_or("novig", novig_fresh)
 
-        og_events: list[dict[str, Any]] = []
+        og_fresh: list[dict[str, Any]] = []
         og_error: str | None = None
         try:
-            og_events = og_task.result() or []
+            og_fresh = og_task.result() or []
         except Exception as e:
             og_error = str(e)
+        og_events = _SOURCE_CACHE.get_or("og", og_fresh)
 
         pm_error: str | None = "; ".join(pm_errors) if pm_errors else None
 

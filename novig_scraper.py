@@ -207,11 +207,11 @@ async def _fetch_order_books(
     return result
 
 
-def _best_bid(ladder: dict, min_liq_cents: float) -> tuple[float, float] | None:
+def _best_bid(ladder: dict, min_liq_dollars: float) -> tuple[float, float] | None:
     """
     Find the best (highest) bid with sufficient liquidity.
     Returns (price, qty_dollars) or None.
-    Novig qty is in cents.
+    Novig qty is in cents — we convert to dollars before comparing.
     """
     bids = ladder.get("bids", [])
     if not bids:
@@ -220,8 +220,8 @@ def _best_bid(ladder: dict, min_liq_cents: float) -> tuple[float, float] | None:
         price = bid.get("price", 0)
         qty = bid.get("qty", 0)
         if isinstance(price, (int, float)) and isinstance(qty, (int, float)):
-            qty_dollars = qty / 100.0
-            if qty_dollars >= min_liq_cents and 0 < price < 1:
+            qty_dollars = qty / 100.0  # cents → dollars
+            if qty_dollars >= min_liq_dollars and 0 < price < 1:
                 return (float(price), qty_dollars)
     return None
 
@@ -260,7 +260,7 @@ def _parse_event(
     start_time = raw.get("scheduled_start") or fetch_ts
 
     markets_out: list[dict[str, Any]] = []
-    min_liq_cents = min_liq * 100  # convert dollars to cents for qty comparison
+    min_liq_dollars = min_liq  # already in dollars; _best_bid converts qty from cents internally
 
     for mkt in raw.get("markets", []):
         mkt_type = mkt.get("type", "")
@@ -286,8 +286,8 @@ def _parse_event(
         ladder1 = ladders.get(o1_id, {})
 
         # Get best bid for each outcome
-        bid0 = _best_bid(ladder0, min_liq_cents)
-        bid1 = _best_bid(ladder1, min_liq_cents)
+        bid0 = _best_bid(ladder0, min_liq_dollars)
+        bid1 = _best_bid(ladder1, min_liq_dollars)
 
         if bid0 is None or bid1 is None:
             continue

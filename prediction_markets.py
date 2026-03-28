@@ -72,7 +72,11 @@ CLOB_WORKERS    = 10
 
 # Polymarket CLOB: market depth minimum for a valid ask price
 CLOB_MIN_SIZE   = 100.0  # $100 minimum depth — filter out illiquid/thin markets
-POLY_MIN_VOLUME = 10_000.0  # $10K minimum trading volume — filter zero-activity markets
+POLY_MIN_VOLUME = 10_000.0  # $10K minimum lifetime trading volume
+
+# Polymarket activity filters — catch dormant markets that have old volume but no recent activity
+POLY_MIN_VOL_24HR  = 500.0    # $500 minimum 24-hour trading volume
+POLY_MIN_CLOB_LIQ  = 1_000.0  # $1K minimum active CLOB liquidity in order book
 
 # Platform fee rates — applied to PROFIT, not settlement value
 #
@@ -1334,8 +1338,11 @@ def _parse_polymarket_event(raw: dict, sport: str, fetch_ts: str) -> dict | None
     if mtype is None:
         return None
 
-    # Extract trading volume for filtering (Gamma API includes this field)
-    raw_volume = _safe_float(raw.get("volume")) or 0.0
+    # Extract trading volume + liquidity for filtering
+    # Market-level fields take priority; fall back to event-level if absent
+    raw_volume = _safe_float(raw.get("volume")) or _safe_float(raw.get("_event_volume")) or 0.0
+    raw_volume_24hr = _safe_float(raw.get("volume24hr")) or _safe_float(raw.get("_event_volume24hr")) or 0.0
+    raw_clob_liquidity = _safe_float(raw.get("liquidityClob")) or _safe_float(raw.get("_event_liquidityClob")) or 0.0
 
     # Outcomes / prices / tokens may be JSON strings or lists
     def _ensure_list(val):
@@ -1450,6 +1457,8 @@ def _parse_polymarket_event(raw: dict, sport: str, fetch_ts: str) -> dict | None
             ],
             "_raw_poly_id": raw.get("id"),
             "_poly_volume": raw_volume,
+            "_poly_volume_24hr": raw_volume_24hr,
+            "_poly_clob_liquidity": raw_clob_liquidity,
         }
 
     elif mtype == "total":
@@ -1502,6 +1511,8 @@ def _parse_polymarket_event(raw: dict, sport: str, fetch_ts: str) -> dict | None
                 },
             ],
             "_poly_volume": raw_volume,
+            "_poly_volume_24hr": raw_volume_24hr,
+            "_poly_clob_liquidity": raw_clob_liquidity,
         }
 
     elif mtype == "spread":
@@ -1588,10 +1599,18 @@ async def _fetch_polymarket_tag(
 
         for event_obj in page_data:
             event_slug = event_obj.get("slug", "")
+            # Event-level volume/liquidity fields (may not exist on nested markets)
+            ev_vol24   = _safe_float(event_obj.get("volume24hr")) or 0.0
+            ev_clob_liq = _safe_float(event_obj.get("liquidityClob")) or 0.0
+            ev_volume  = _safe_float(event_obj.get("volume")) or 0.0
             nested_markets = event_obj.get("markets") or []
             for raw in nested_markets:
                 if not raw.get("slug"):
                     raw["slug"] = event_slug
+                # Inject event-level fields so market parser can access them
+                raw.setdefault("_event_volume", ev_volume)
+                raw.setdefault("_event_volume24hr", ev_vol24)
+                raw.setdefault("_event_liquidityClob", ev_clob_liq)
                 parsed = _parse_polymarket_event(raw, sport, fetch_ts)
                 if parsed:
                     events.append(parsed)
@@ -1768,24 +1787,52 @@ async def update_polymarket_clob_prices(events: list[dict]) -> list[dict]:
             )
             m["_price_is_stale_midprice"] = True
 
-    # Volume filter: exclude entire events with insufficient trading volume
+    # Multi-layer volume + liquidity filter:
+    # A market is excluded if it fails ANY of:
+    #   1. Lifetime volume < $10K  (too small / never gained traction)
+    #   2. 24hr volume < $500 AND CLOB liquidity < $1K  (dormant — no recent activity)
+    # This catches markets with old accumulated volume but zero current trading.
     volume_excluded = 0
     for event in events:
-        raw_volume = float(event.get("_poly_volume", 0))
-        if raw_volume < POLY_MIN_VOLUME:
+        lifetime_vol = float(event.get("_poly_volume", 0))
+        vol_24hr     = float(event.get("_poly_volume_24hr", 0))
+        clob_liq     = float(event.get("_poly_clob_liquidity", 0))
+
+        exclude = False
+        reason  = ""
+
+        if lifetime_vol < POLY_MIN_VOLUME:
+            exclude = True
+            reason = f"lifetime vol ${lifetime_vol:.0f} < ${POLY_MIN_VOLUME:.0f}"
+        elif vol_24hr < POLY_MIN_VOL_24HR and clob_liq < POLY_MIN_CLOB_LIQ:
+            exclude = True
+            reason = (
+                f"dormant: 24hr vol ${vol_24hr:.0f} < ${POLY_MIN_VOL_24HR:.0f} "
+                f"AND CLOB liq ${clob_liq:.0f} < ${POLY_MIN_CLOB_LIQ:.0f}"
+            )
+
+        if exclude:
             volume_excluded += 1
             for m in event.get("markets") or []:
                 m["_price_is_stale_midprice"] = True
             logger.debug(
-                "Polymarket %s vs %s: volume $%.0f < $%.0f minimum — excluding",
+                "Polymarket EXCLUDED %s vs %s: %s (lifetime=$%.0f, 24hr=$%.0f, clob_liq=$%.0f)",
                 event.get("away_team", "?"), event.get("home_team", "?"),
-                raw_volume, POLY_MIN_VOLUME,
+                reason, lifetime_vol, vol_24hr, clob_liq,
+            )
+        else:
+            logger.debug(
+                "Polymarket PASSED %s vs %s: lifetime=$%.0f, 24hr=$%.0f, clob_liq=$%.0f",
+                event.get("away_team", "?"), event.get("home_team", "?"),
+                lifetime_vol, vol_24hr, clob_liq,
             )
 
     updated = sum(1 for m in token_markets if m.get("_clob_updated"))
     logger.info(
-        "Polymarket CLOB: updated %d/%d market prices, %d events excluded (volume < $%.0f)",
-        updated, len(token_markets), volume_excluded, POLY_MIN_VOLUME,
+        "Polymarket CLOB: updated %d/%d prices, %d/%d events excluded "
+        "(vol < $%.0f OR dormant: 24hr < $%.0f & liq < $%.0f)",
+        updated, len(token_markets), volume_excluded, len(events),
+        POLY_MIN_VOLUME, POLY_MIN_VOL_24HR, POLY_MIN_CLOB_LIQ,
     )
     return events
 

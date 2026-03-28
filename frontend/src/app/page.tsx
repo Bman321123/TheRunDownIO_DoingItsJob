@@ -4,7 +4,6 @@ import { useEffect, useMemo, useState } from "react";
 import type { Arb, RawLine, BestLine, ScanNowResponse } from "@/lib/types";
 import Image from "next/image";
 import { ArbCard } from "@/components/ArbCard";
-import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { UnderlineTabs } from "@/components/ui/underline-tabs";
 import { AnimatedTextReveal } from "@/components/ui/animated-text-reveal";
@@ -17,7 +16,8 @@ const DEFAULT_BASE = "http://127.0.0.1:3030";
 const SPORTS = ["NCAAF", "NFL", "MLB", "NBA", "NCAAB", "NHL", "NCAAWB", "MMA"] as const;
 type Sport = (typeof SPORTS)[number];
 
-const SCAN_LABELS = ["Scanning lines…", "Fetching odds…", "Matching games…", "Calculating arbs…"] as const;
+const SCAN_LABELS = ["Scanning lines...", "Fetching odds...", "Matching games...", "Calculating arbs..."] as const;
+const SCAN_COOLDOWN_MS = 3_000; // 3-second breather between scans
 export default function HomePage() {
   const baseUrl = process.env.NEXT_PUBLIC_ARBS_URL || DEFAULT_BASE;
   const arbsUrl = `${baseUrl.replace(/\/$/, "")}/arbs`;
@@ -30,11 +30,12 @@ export default function HomePage() {
   const [bestLines, setBestLines] = useState<BestLine[]>([]);
   const [status, setStatus] = useState<"idle" | "loading" | "ok" | "error">("idle");
   const [scanStatus, setScanStatus] = useState<"idle" | "scanning" | "error">("idle");
+  const [scanLabel, setScanLabel] = useState<string>(SCAN_LABELS[0]);
   const [error, setError] = useState<string | null>(null);
   const [lastScannedMs, setLastScannedMs] = useState<number | null>(null);
   const [dataAge, setDataAge] = useState<number | null>(null);
   const [dpRemaining, setDpRemaining] = useState<string | null>(null);
-  // Intentionally no "arb entrance" stagger animation (handled by PRD UI fixes).
+  const [secondsAgo, setSecondsAgo] = useState<number | null>(null);
 
   const [activeTab, setActiveTab] = useState<"arbs" | "lines" | "best">("arbs");
   const [displayTab, setDisplayTab] = useState<"arbs" | "lines" | "best">(activeTab);
@@ -50,56 +51,49 @@ export default function HomePage() {
     });
 
   const count = arbs.length;
-  const header = useMemo(() => {
-    if (status === "loading") return "Loading…";
-    if (status === "error") return "Disconnected";
-    return "Cached";
-  }, [status]);
 
-  // Initial load: fetch cached arbs once
+  // Tick "seconds ago" counter every second
   useEffect(() => {
-    let mounted = true;
-    (async () => {
-      try {
-        setStatus("loading");
-        const resp = await fetch(arbsUrl, { cache: "no-store" });
-        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-        const data = await resp.json();
-        if (!mounted) return;
-        setArbs(Array.isArray(data.arbs) ? data.arbs : Array.isArray(data) ? data : []);
-        setLines(Array.isArray(data.lines) ? data.lines : []);
-        setBestLines(Array.isArray(data.bestLines) ? data.bestLines : []);
-        if (typeof data.dataAge === "number") setDataAge(data.dataAge);
-        if (data.dpRemaining) setDpRemaining(data.dpRemaining);
-        setStatus("ok");
-        setError(null);
-      } catch (e: any) {
-        if (!mounted) return;
-        setStatus("error");
-        setError(e?.message || "Failed to load");
-      }
-    })();
-    return () => {
-      mounted = false;
-    };
-  }, [arbsUrl]);
+    const id = window.setInterval(() => {
+      setLastScannedMs((prev) => {
+        if (prev) setSecondsAgo(Math.floor((Date.now() - prev) / 1000));
+        return prev;
+      });
+    }, 1_000);
+    return () => window.clearInterval(id);
+  }, []);
+
+  // Cycle scan labels while scanning
+  useEffect(() => {
+    if (scanStatus !== "scanning") return;
+    let idx = 0;
+    setScanLabel(SCAN_LABELS[0]);
+    const id = window.setInterval(() => {
+      idx = (idx + 1) % SCAN_LABELS.length;
+      setScanLabel(SCAN_LABELS[idx]);
+    }, 900);
+    return () => window.clearInterval(id);
+  }, [scanStatus]);
 
   useEffect(() => {
     if (activeTab === displayTab) return;
-
-    // Tiny delay so the fade-out of old content isn't jarring.
     const timer = window.setTimeout(() => {
       setDisplayTab(activeTab);
       setTabKey((k) => k + 1);
     }, 80);
-
     return () => window.clearTimeout(timer);
   }, [activeTab, displayTab]);
 
-  async function scanNow() {
-    const sports = Array.from(selectedSports);
-    if (sports.length === 0) return;
-    try {
+  // Continuous scan loop: scan → cooldown → scan → cooldown → ...
+  // Cancels cleanly when selectedSports or URLs change (effect re-runs).
+  useEffect(() => {
+    let cancelled = false;
+    const abortCtrl = new AbortController();
+
+    async function doOneScan() {
+      const sports = Array.from(selectedSports);
+      if (sports.length === 0) return;
+
       setScanStatus("scanning");
       setError(null);
 
@@ -107,6 +101,7 @@ export default function HomePage() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ sports }),
+        signal: abortCtrl.signal,
       });
 
       if (!resp.ok || !resp.body) {
@@ -115,6 +110,7 @@ export default function HomePage() {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ sports }),
+          signal: abortCtrl.signal,
         });
         const payload = (await fallback.json()) as ScanNowResponse;
         if (!fallback.ok || !payload?.ok) {
@@ -124,9 +120,9 @@ export default function HomePage() {
         setLines(Array.isArray(payload.lines) ? payload.lines : []);
         setBestLines(Array.isArray(payload.bestLines) ? payload.bestLines : []);
         setLastScannedMs(payload.lastScanMs ?? Date.now());
+        setSecondsAgo(0);
         if (typeof payload.dataAge === "number") setDataAge(payload.dataAge);
         if (payload.dpRemaining) setDpRemaining(payload.dpRemaining);
-        setScanStatus("idle");
         return;
       }
 
@@ -135,14 +131,13 @@ export default function HomePage() {
       const decoder = new TextDecoder();
       let buffer = "";
 
-      while (true) {
+      while (!cancelled) {
         const { done, value } = await reader.read();
         if (done) break;
         buffer += decoder.decode(value, { stream: true });
 
-        // Parse SSE events from buffer (split on double newline)
         const parts = buffer.split("\n\n");
-        buffer = parts.pop()!; // keep incomplete chunk
+        buffer = parts.pop()!;
 
         for (const raw of parts) {
           if (!raw.trim()) continue;
@@ -153,10 +148,7 @@ export default function HomePage() {
             if (Array.isArray(payload.arbs)) setArbs(payload.arbs);
             if (Array.isArray(payload.lines)) setLines(payload.lines);
             if (Array.isArray(payload.bestLines)) setBestLines(payload.bestLines);
-            if (payload.lastScanMs) setLastScannedMs(payload.lastScanMs);
-            if (payload.sourceCounts) {
-              // sourceCounts available for display if needed
-            }
+            if (payload.lastScanMs) { setLastScannedMs(payload.lastScanMs); setSecondsAgo(0); }
             if (typeof payload.dataAge === "number") setDataAge(payload.dataAge);
             if (payload.dpRemaining) setDpRemaining(payload.dpRemaining);
           } catch {
@@ -164,12 +156,38 @@ export default function HomePage() {
           }
         }
       }
-      setScanStatus("idle");
-    } catch (e: any) {
-      setScanStatus("error");
-      setError(e?.message || "Scan failed");
     }
-  }
+
+    async function loop() {
+      while (!cancelled) {
+        try {
+          await doOneScan();
+          setScanStatus("idle");
+        } catch (e: any) {
+          if (cancelled) return;
+          setScanStatus("error");
+          setError(e?.message || "Scan failed");
+        }
+        // Brief cooldown before next scan
+        if (!cancelled) {
+          await new Promise<void>((r) => {
+            const t = setTimeout(r, SCAN_COOLDOWN_MS);
+            // If cancelled during cooldown, resolve immediately
+            const check = setInterval(() => {
+              if (cancelled) { clearTimeout(t); clearInterval(check); r(); }
+            }, 200);
+          });
+        }
+      }
+    }
+
+    loop();
+
+    return () => {
+      cancelled = true;
+      abortCtrl.abort();
+    };
+  }, [selectedSports, scanStreamUrl, scanUrl]);
 
   return (
     <main className="space-y-5">
@@ -180,39 +198,46 @@ export default function HomePage() {
               <AnimatedTextReveal text="Arbitrage Dashboard" />
             </div>
             <div className="mt-1 text-sm text-secondary">
-              Scan and compare book lines to surface both-sides value.{" "}
-              <span className="font-mono tracking-tight text-muted-text">{baseUrl}</span>
+              Auto-scanning book lines to surface both-sides value.
             </div>
           </div>
 
           <div className="flex items-center gap-4">
-            {dataAge !== null && (
-              <div className="text-right">
-                <div className="text-xs text-[#9898B8]">Data Age</div>
-                <div className={[
-                  "text-sm font-semibold",
-                  dataAge > 300 ? "text-red-700" : dataAge > 120 ? "text-amber-700" : "text-emerald-700",
-                ].join(" ")}>
-                  {dataAge < 60 ? `${dataAge}s` : `${Math.floor(dataAge / 60)}m ${dataAge % 60}s`}
-                </div>
-              </div>
-            )}
             {dpRemaining && (
               <div className="text-right">
                 <div className="text-xs text-[#9898B8]">DP Left</div>
                 <div className="text-sm font-semibold text-[#E8E8F8]">{dpRemaining}</div>
               </div>
             )}
-            <div className="text-right">
-              <div className="text-xs text-[#9898B8]">Status</div>
-              <div className="text-sm font-semibold text-[#E8E8F8]">{header}</div>
+            {/* Live status indicator */}
+            <div className="flex items-center gap-2">
+              {scanStatus === "scanning" ? (
+                <>
+                  <span className="relative flex h-2.5 w-2.5">
+                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
+                    <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-emerald-500" />
+                  </span>
+                  <span className="text-xs font-medium text-emerald-400 animate-pulse">{scanLabel}</span>
+                </>
+              ) : scanStatus === "error" ? (
+                <>
+                  <span className="h-2.5 w-2.5 rounded-full bg-red-500" />
+                  <span className="text-xs font-medium text-red-400">Disconnected</span>
+                </>
+              ) : (
+                <>
+                  <span className="h-2.5 w-2.5 rounded-full bg-emerald-500" />
+                  <span className="text-xs font-medium text-emerald-400">Live</span>
+                </>
+              )}
             </div>
           </div>
         </div>
 
-        {dataAge !== null && dataAge > 300 && (
-          <div className="rounded-lg bg-amber-500/10 border border-amber-500/25 px-3 py-2 text-xs text-amber-200">
-            Data is {Math.floor(dataAge / 60)}+ minutes old. Odds may have changed. Click &quot;Scan Lines&quot; to refresh.
+        {/* Scanning progress bar */}
+        {scanStatus === "scanning" && (
+          <div className="relative h-1 w-full overflow-hidden rounded-full bg-white/[0.06]">
+            <div className="absolute inset-0 h-full w-1/3 animate-scan-bar rounded-full bg-gradient-to-r from-transparent via-emerald-400 to-transparent" />
           </div>
         )}
 
@@ -242,34 +267,40 @@ export default function HomePage() {
               </button>
             );
           })}
-          <div className="flex-1" />
-          <Button
-            type="button"
-            variant="scan"
-            loading={scanStatus === "scanning"}
-            disabled={selectedSports.size === 0}
-            scanLabels={Array.from(SCAN_LABELS)}
-            onClick={scanNow}
-          >
-            Scan Lines
-          </Button>
         </div>
 
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="text-xs text-[#9898B8]">
             Opportunities: <span className="font-semibold text-[#E8E8F8]">{count}</span>
           </div>
-          <div className="text-xs text-[#9898B8]">
-            Last scanned:{" "}
-            <span className="font-semibold text-[#E8E8F8]">
-              {lastScannedMs ? new Date(lastScannedMs).toLocaleTimeString() : "—"}
-            </span>
+          <div className="flex items-center gap-3">
+            <div className="text-xs text-[#9898B8]">
+              Updated:{" "}
+              <span className="font-semibold text-[#E8E8F8]">
+                {secondsAgo != null
+                  ? secondsAgo < 5
+                    ? "just now"
+                    : secondsAgo < 60
+                      ? `${secondsAgo}s ago`
+                      : `${Math.floor(secondsAgo / 60)}m ${secondsAgo % 60}s ago`
+                  : scanStatus === "scanning"
+                    ? "scanning..."
+                    : "—"}
+              </span>
+            </div>
+            <div className="text-xs text-[#9898B8]">
+              <span className="font-semibold text-[#E8E8F8]">
+                {scanStatus === "scanning"
+                  ? "Auto-refreshing"
+                  : "Next scan queued"}
+              </span>
+            </div>
           </div>
         </div>
 
-        {status === "error" || scanStatus === "error" ? (
+        {scanStatus === "error" ? (
           <div className="text-xs text-[#FCA5A5]">
-            Error: {error}. Make sure `/Users/seniortech/therundownioV1/server.py` is running on port 3030.
+            Error: {error}. Retrying automatically...
           </div>
         ) : null}
 

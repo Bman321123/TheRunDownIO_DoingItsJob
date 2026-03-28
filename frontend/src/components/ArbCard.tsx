@@ -16,6 +16,20 @@ function formatOddsAm(o: number): string {
   return o > 0 ? `+${o}` : `${o}`;
 }
 
+/** American odds → decimal */
+function amToDec(am: number): number {
+  if (am >= 100) return am / 100 + 1;
+  if (am <= -100) return 100 / Math.abs(am) + 1;
+  return 0;
+}
+
+/** Cost to win $1 total payout (i.e. implied probability) */
+function costPerDollar(oddsAm: number): number | null {
+  const dec = amToDec(oddsAm);
+  if (dec <= 1) return null;
+  return 1 / dec;
+}
+
 export function ArbCard({ arb }: { arb: Arb }) {
   const { away, home } = parseMatchup(arb.game);
   const league = arb.sport || "NBA";
@@ -107,60 +121,99 @@ export function ArbCard({ arb }: { arb: Arb }) {
       </div>
 
       {/* Legs + Place Bets button */}
-      <div className="flex gap-3 px-5 py-4">
-        {/* Two legs side by side */}
-        <div className="flex-1 grid grid-cols-1 gap-3 md:grid-cols-2">
-          <LegBlock
-            label="Leg A"
-            side={arb.side_a}
-            book={arb.book_a}
-            odds={arb.odds_a_am}
-            stake={arb.stake_a}
-            game={arb.game}
-            league={league}
-            url={arb.url_a}
-          />
-          <LegBlock
-            label="Leg B"
-            side={arb.side_b}
-            book={arb.book_b}
-            odds={arb.odds_b_am}
-            stake={arb.stake_b}
-            game={arb.game}
-            league={league}
-            url={arb.url_b}
-            danger={arb.same_book === true}
-          />
-        </div>
+      {(() => {
+        const costA = costPerDollar(arb.odds_a_am);
+        const costB = costPerDollar(arb.odds_b_am);
+        const combined = costA != null && costB != null ? costA + costB : null;
+        const isArb = combined != null && combined < 1;
+        return (
+          <>
+            <div className="flex gap-3 px-5 py-4">
+              {/* Two legs side by side */}
+              <div className="flex-1 grid grid-cols-1 gap-3 md:grid-cols-2">
+                <LegBlock
+                  label="Leg A"
+                  side={arb.side_a}
+                  book={arb.book_a}
+                  odds={arb.odds_a_am}
+                  stake={arb.stake_a}
+                  game={arb.game}
+                  league={league}
+                  url={arb.url_a}
+                  costPerDollar={costA}
+                />
+                <LegBlock
+                  label="Leg B"
+                  side={arb.side_b}
+                  book={arb.book_b}
+                  odds={arb.odds_b_am}
+                  stake={arb.stake_b}
+                  game={arb.game}
+                  league={league}
+                  url={arb.url_b}
+                  danger={arb.same_book === true}
+                  costPerDollar={costB}
+                />
+              </div>
 
-        {/* Place Bets button spanning full height of both legs */}
-        <button
-          type="button"
-          onClick={handlePlaceBets}
-          className="flex flex-col items-center justify-center gap-2 rounded-lg bg-sky-500/15 border border-sky-500/30 px-3 min-w-[52px] text-sky-400 hover:bg-sky-500/25 hover:border-sky-400/50 transition-all cursor-pointer group"
-        >
-          <svg
-            xmlns="http://www.w3.org/2000/svg"
-            viewBox="0 0 20 20"
-            fill="currentColor"
-            className="h-5 w-5 group-hover:scale-110 transition-transform"
-          >
-            <path
-              fillRule="evenodd"
-              d="M4.25 5.5a.75.75 0 0 0-.75.75v8.5c0 .414.336.75.75.75h8.5a.75.75 0 0 0 .75-.75v-4a.75.75 0 0 1 1.5 0v4A2.25 2.25 0 0 1 12.75 17h-8.5A2.25 2.25 0 0 1 2 14.75v-8.5A2.25 2.25 0 0 1 4.25 4h5a.75.75 0 0 1 0 1.5h-5Z"
-              clipRule="evenodd"
-            />
-            <path
-              fillRule="evenodd"
-              d="M6.194 12.753a.75.75 0 0 0 1.06.053L16.5 4.44v2.81a.75.75 0 0 0 1.5 0v-4.5a.75.75 0 0 0-.75-.75h-4.5a.75.75 0 0 0 0 1.5h2.553l-9.056 8.194a.75.75 0 0 0-.053 1.06Z"
-              clipRule="evenodd"
-            />
-          </svg>
-          <span className="text-[10px] font-bold uppercase tracking-wider [writing-mode:vertical-lr] rotate-180">
-            Place Bets
-          </span>
-        </button>
-      </div>
+              {/* Place Bets button spanning full height of both legs */}
+              <button
+                type="button"
+                onClick={handlePlaceBets}
+                className="flex flex-col items-center justify-center gap-2 rounded-lg bg-sky-500/15 border border-sky-500/30 px-3 min-w-[52px] text-sky-400 hover:bg-sky-500/25 hover:border-sky-400/50 transition-all cursor-pointer group"
+              >
+                <svg
+                  xmlns="http://www.w3.org/2000/svg"
+                  viewBox="0 0 20 20"
+                  fill="currentColor"
+                  className="h-5 w-5 group-hover:scale-110 transition-transform"
+                >
+                  <path
+                    fillRule="evenodd"
+                    d="M4.25 5.5a.75.75 0 0 0-.75.75v8.5c0 .414.336.75.75.75h8.5a.75.75 0 0 0 .75-.75v-4a.75.75 0 0 1 1.5 0v4A2.25 2.25 0 0 1 12.75 17h-8.5A2.25 2.25 0 0 1 2 14.75v-8.5A2.25 2.25 0 0 1 4.25 4h5a.75.75 0 0 1 0 1.5h-5Z"
+                    clipRule="evenodd"
+                  />
+                  <path
+                    fillRule="evenodd"
+                    d="M6.194 12.753a.75.75 0 0 0 1.06.053L16.5 4.44v2.81a.75.75 0 0 0 1.5 0v-4.5a.75.75 0 0 0-.75-.75h-4.5a.75.75 0 0 0 0 1.5h2.553l-9.056 8.194a.75.75 0 0 0-.053 1.06Z"
+                    clipRule="evenodd"
+                  />
+                </svg>
+                <span className="text-[10px] font-bold uppercase tracking-wider [writing-mode:vertical-lr] rotate-180">
+                  Place Bets
+                </span>
+              </button>
+            </div>
+
+            {/* Cost-per-dollar summary bar */}
+            {combined != null && (
+              <div className="mx-5 mb-4 flex items-center justify-between rounded-lg border border-border bg-overlay px-4 py-2.5">
+                <div className="flex items-center gap-4 text-xs">
+                  <span className="text-secondary">Cost to win $1:</span>
+                  <span className="font-mono font-semibold text-primary">
+                    A: ${costA!.toFixed(4)}
+                  </span>
+                  <span className="text-secondary">+</span>
+                  <span className="font-mono font-semibold text-primary">
+                    B: ${costB!.toFixed(4)}
+                  </span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="text-xs text-secondary">=</span>
+                  <span className={`font-mono text-sm font-bold ${isArb ? "text-[#34D399]" : "text-[#F87171]"}`}>
+                    ${combined.toFixed(4)}
+                  </span>
+                  {isArb ? (
+                    <Badge variant="success" className="text-[10px] font-bold">ARB</Badge>
+                  ) : (
+                    <Badge variant="danger" className="text-[10px] font-bold">NO ARB</Badge>
+                  )}
+                </div>
+              </div>
+            )}
+          </>
+        );
+      })()}
 
       {arb.same_book ? (
         <div className="px-5 pb-4 text-xs text-accent-amber">
@@ -181,6 +234,7 @@ function LegBlock(props: {
   league: string;
   url?: string;
   danger?: boolean;
+  costPerDollar?: number | null;
 }) {
   const logo = bookLogoPath(props.book);
   const { home, away } = parseMatchup(props.game);
@@ -241,10 +295,20 @@ function LegBlock(props: {
             {props.book}
           </span>
         </a>
-        <div className="text-right">
-          <div className="text-[11px] text-secondary">Stake</div>
-          <div className="text-sm font-semibold text-primary font-mono tracking-tight">
-            ${props.stake.toFixed(2)}
+        <div className="flex items-center gap-4">
+          {props.costPerDollar != null && (
+            <div className="text-right">
+              <div className="text-[11px] text-secondary">Cost/$1</div>
+              <div className="text-sm font-semibold text-primary font-mono tracking-tight">
+                ${props.costPerDollar.toFixed(4)}
+              </div>
+            </div>
+          )}
+          <div className="text-right">
+            <div className="text-[11px] text-secondary">Stake</div>
+            <div className="text-sm font-semibold text-primary font-mono tracking-tight">
+              ${props.stake.toFixed(2)}
+            </div>
           </div>
         </div>
       </div>
